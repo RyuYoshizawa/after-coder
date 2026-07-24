@@ -640,6 +640,13 @@ if st.button('🚀 分析開始', type='primary', use_container_width=True,
         )
 
     if result:
+        st.session_state['result'] = result
+        st.session_state['q_name'] = q_name
+
+if 'result' in st.session_state:
+    result = st.session_state['result']
+    q_name = st.session_state.get('q_name', q_name)
+    if True:
         st.success('✅ 分析が完了しました！')
         st.divider()
 
