@@ -9,29 +9,51 @@ import re
 import time
 
 
+# グローバルトークンカウンター
+_token_usage = {'input': 0, 'output': 0}
+
+def reset_token_usage():
+    """トークンカウンターをリセット"""
+    _token_usage['input']  = 0
+    _token_usage['output'] = 0
+
+def get_token_usage() -> dict:
+    """現在のトークン使用量を返す"""
+    return dict(_token_usage)
+
+def calc_cost_jpy(input_tokens: int, output_tokens: int, model: str) -> float:
+    """
+    概算コストを円で返す（1USD=150円換算）
+    claude-sonnet-4-6: input $3/1M, output $15/1M
+    """
+    rate = 150  # USD→JPY
+    if 'sonnet' in model:
+        cost = (input_tokens / 1_000_000 * 3 + output_tokens / 1_000_000 * 15) * rate
+    elif 'haiku' in model:
+        cost = (input_tokens / 1_000_000 * 0.25 + output_tokens / 1_000_000 * 1.25) * rate
+    else:
+        cost = (input_tokens / 1_000_000 * 3 + output_tokens / 1_000_000 * 15) * rate
+    return round(cost, 1)
+
+
 def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> dict | list | None:
     """
     構造化出力でLLMを呼び出す。
     tool_use / function_calling → 失敗時はJSONフォールバックの順で試みる。
-
-    Args:
-        client:   anthropic.Anthropic() または openai.OpenAI() のインスタンス
-        prompt:   ユーザープロンプト
-        schema:   出力スキーマ（JSONスキーマ形式）
-        provider: 'Anthropic' または 'OpenAI'
-        model:    使用するモデル名
-
-    Returns:
-        パース済みのdict/list、失敗時はNone
+    トークン使用量をグローバルカウンターに累積する。
     """
     for attempt in range(3):
         try:
             if provider == 'Anthropic':
-                result = _call_anthropic(client, prompt, schema, model)
+                result, usage = _call_anthropic(client, prompt, schema, model)
             elif provider == 'OpenAI':
-                result = _call_openai(client, prompt, schema, model)
+                result, usage = _call_openai(client, prompt, schema, model)
             else:
                 raise ValueError(f'未対応のプロバイダ: {provider}')
+
+            if usage:
+                _token_usage['input']  += usage.get('input', 0)
+                _token_usage['output'] += usage.get('output', 0)
 
             if result is not None:
                 return result
@@ -40,12 +62,11 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
             print(f'\n  [リトライ{attempt+1}] {type(e).__name__}: {e}')
             time.sleep(1)
 
-    # 全て失敗した場合
     print('\n  [警告] 構造化出力に失敗しました。このバッチをスキップします。')
     return None
 
 
-def _call_anthropic(client, prompt: str, schema: dict, model: str) -> dict | list | None:
+def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
     """Anthropic tool_use を使った構造化呼び出し"""
     tool = {
         'name': 'output_result',
@@ -59,20 +80,22 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> dict | lis
         tool_choice={'type': 'any'},
         messages=[{'role': 'user', 'content': prompt}]
     )
-    # tool_useブロックを探す
+    usage = {
+        'input':  response.usage.input_tokens,
+        'output': response.usage.output_tokens,
+    }
     for block in response.content:
         if block.type == 'tool_use' and block.name == 'output_result':
-            return block.input
-    # tool_useがない場合はtextブロックからJSONをパース（フォールバック）
+            return block.input, usage
     for block in response.content:
         if block.type == 'text':
             result = _parse_json_text(block.text)
             if result is not None:
-                return result
-    return None
+                return result, usage
+    return None, usage
 
 
-def _call_openai(client, prompt: str, schema: dict, model: str) -> dict | list | None:
+def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
     """OpenAI function_calling を使った構造化呼び出し"""
     tool = {
         'type': 'function',
@@ -89,15 +112,18 @@ def _call_openai(client, prompt: str, schema: dict, model: str) -> dict | list |
         tool_choice='auto',
         messages=[{'role': 'user', 'content': prompt}]
     )
+    usage = {
+        'input':  response.usage.prompt_tokens,
+        'output': response.usage.completion_tokens,
+    }
     msg = response.choices[0].message
     if msg.tool_calls:
         for tc in msg.tool_calls:
             if tc.function.name == 'output_result':
-                return json.loads(tc.function.arguments)
-    # フォールバック
+                return json.loads(tc.function.arguments), usage
     if msg.content:
-        return _parse_json_text(msg.content)
-    return None
+        return _parse_json_text(msg.content), usage
+    return None, usage
 
 
 def _parse_json_text(text: str) -> dict | list | None:

@@ -15,7 +15,7 @@ from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
-from llm_client import call_llm, make_client
+from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, calc_cost_jpy
 
 APP_DIR = Path(__file__).parent
 
@@ -471,6 +471,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
 def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context=''):
     """コードブック策定→全件コーディング→集計を実行"""
 
+    reset_token_usage()
     client = make_client('Anthropic', api_key)
     all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
     random.shuffle(all_items)
@@ -540,6 +541,7 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     progress_bar.progress(1.0)
     status_text.markdown('**✅ 分析完了！**')
 
+    usage = get_token_usage()
     return {
         'codebook': codebook,
         'codes':    codes,
@@ -548,6 +550,7 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
         'sent':     sent_counts,
         'total':    total,
         'items':    all_items,
+        'usage':    usage,
     }
 # ══════════════════════════════════════════════════
 # Streamlit UI
@@ -652,6 +655,19 @@ if 'result' in st.session_state:
     q_name = st.session_state.get('q_name', q_name)
     if True:
         st.success('✅ 分析が完了しました！')
+
+        # コスト表示
+        usage = result.get('usage', {})
+        inp   = usage.get('input', 0)
+        out   = usage.get('output', 0)
+        cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
+        with st.expander('💰 API使用コスト（参考）'):
+            c1, c2, c3 = st.columns(3)
+            c1.metric('入力トークン', f'{inp:,}')
+            c2.metric('出力トークン', f'{out:,}')
+            c3.metric('推定コスト', f'約 ¥{cost:.0f}')
+            st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
+
         st.divider()
 
         # ── 結果表示 ──────────────────────────────
