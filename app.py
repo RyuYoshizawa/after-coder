@@ -392,7 +392,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
     # 集計ダイジェストシート
     # ══════════════════════════════════════════════════
     ws2 = wb.create_sheet('集計ダイジェスト')
-    ws2.sheet_view.showGridLines = False
+    ws2.sheet_view.showGridLines = FalseCD
 
     # タイトル
     ws2.cell(row=1, column=1, value=f'After Coder 集計ダイジェスト：{q_name}').font = Font(
@@ -671,18 +671,29 @@ if 'result' in st.session_state:
         st.divider()
 
         # GT集計
-        st.markdown('#### 📈 コード別GT集計（出現率順）')
+        st.markdown('#### 📈 コード別GT集計')
         gt = result['gt']
-
-        # 上位コードをバーチャートで表示
         import pandas as pd
-        df = pd.DataFrame(gt)[['code_name','count','pct']].head(20)
+
+        # 表示順の切り替え
+        sort_mode = st.radio(
+            '表示順',
+            ['順A：カテゴリ順→コード出現率順', '順B：コード出現率が多い順'],
+            horizontal=True
+        )
+
+        if sort_mode == '順B：コード出現率が多い順':
+            gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
+        else:
+            gt_sorted = sorted(gt, key=lambda x: (x['cat_id'], -x['count']))
+
+        df = pd.DataFrame(gt_sorted)[['code_name','count','pct']]
         df.columns = ['コード名', '件数', '出現率(%)']
         st.bar_chart(df.set_index('コード名')['出現率(%)'])
 
         # テーブル表示
         with st.expander('全コード一覧を表示'):
-            df_full = pd.DataFrame(gt)[['cat_name','code_id','code_name','count','pct','definition']]
+            df_full = pd.DataFrame(gt_sorted)[['cat_name','code_id','code_name','count','pct','definition']]
             df_full.columns = ['カテゴリ','コードID','コード名','件数','出現率(%)','定義']
             st.dataframe(df_full, use_container_width=True, hide_index=True)
 
