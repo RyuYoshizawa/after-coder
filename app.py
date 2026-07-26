@@ -678,7 +678,7 @@ if 'result' in st.session_state:
         # 表示順の切り替え
         sort_mode = st.radio(
             '表示順',
-            ['順A：カテゴリ順→コード出現率順', '順B：コード出現率が多い順'],
+            ['順A：カテゴリ出現率順→コード出現率順', '順B：コード出現率が多い順'],
             horizontal=True
         )
 
@@ -692,11 +692,40 @@ if 'result' in st.session_state:
         else:
             gt_sorted = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
 
-        df = pd.DataFrame(gt_sorted)[['code_name','count','pct']]
-        df.columns = ['コード名', '件数', '出現率(%)']
-        st.bar_chart(df.set_index('コード名')['出現率(%)'])
+        # plotlyでカテゴリ別色分けグラフ
+        import plotly.express as px
+        df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
+        df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
+        fig = px.bar(
+            df_plot,
+            x='コード名',
+            y='出現率(%)',
+            color='カテゴリ',
+            category_orders={'コード名': df_plot['コード名'].tolist()},
+            labels={'出現率(%)': '出現率(%)', 'コード名': ''},
+        )
+        fig.update_layout(
+            xaxis_tickangle=-45,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            height=500,
+            margin=dict(b=120),
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        # テーブル表示
+        # カテゴリ集計
+        with st.expander('カテゴリ別集計を表示'):
+            cat_summary = {}
+            for item in gt_sorted:
+                cid = item['cat_id']
+                if cid not in cat_summary:
+                    cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
+                cat_summary[cid]['件数'] += item['count']
+            df_cat = pd.DataFrame(list(cat_summary.values()))
+            df_cat['出現率(%)'] = (df_cat['件数'] / total * 100).round(1)
+            df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
+            st.dataframe(df_cat, use_container_width=True, hide_index=True)
+
+        # 全コード一覧
         with st.expander('全コード一覧を表示'):
             df_full = pd.DataFrame(gt_sorted)[['cat_name','code_id','code_name','count','pct','definition']]
             df_full.columns = ['カテゴリ','コードID','コード名','件数','出現率(%)','定義']

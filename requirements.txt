@@ -2,3 +2,4 @@ streamlit
 anthropic
 openpyxl
 pandas
+plotly
