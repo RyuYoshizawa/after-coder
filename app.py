@@ -392,7 +392,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
     # 集計ダイジェストシート
     # ══════════════════════════════════════════════════
     ws2 = wb.create_sheet('集計ダイジェスト')
-    ws2.sheet_view.showGridLines = FalseCD
+    ws2.sheet_view.showGridLines = False
 
     # タイトル
     ws2.cell(row=1, column=1, value=f'After Coder 集計ダイジェスト：{q_name}').font = Font(
@@ -682,10 +682,15 @@ if 'result' in st.session_state:
             horizontal=True
         )
 
+        # カテゴリ別出現数を集計
+        cat_total = {}
+        for item in gt:
+            cat_total[item['cat_id']] = cat_total.get(item['cat_id'], 0) + item['count']
+
         if sort_mode == '順B：コード出現率が多い順':
             gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
         else:
-            gt_sorted = sorted(gt, key=lambda x: (x['cat_id'], -x['count']))
+            gt_sorted = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
 
         df = pd.DataFrame(gt_sorted)[['code_name','count','pct']]
         df.columns = ['コード名', '件数', '出現率(%)']
