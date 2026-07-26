@@ -11,16 +11,20 @@ import time
 import random
 import io
 import openpyxl
+from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
 from llm_client import call_llm, make_client
+
+APP_DIR = Path(__file__).parent
 
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
     page_icon='📊',
     layout='wide'
 )
+st.logo(str(APP_DIR / 'mj.png'), size='large')
 
 # ── スタイル ──────────────────────────────────────────────────────
 st.markdown("""
