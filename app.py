@@ -656,7 +656,7 @@ st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
 if st.button('🚀 分析開始', type='primary', use_container_width=True,
-             disabled=not (uploaded and q_name and api_key)):
+             disabled=not (texts and q_name and api_key)):
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
