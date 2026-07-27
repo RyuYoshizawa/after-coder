@@ -641,7 +641,7 @@ with col1:
 
 with col2:
     st.markdown('### ✅ 分析設定の確認')
-    if uploaded and q_name and api_key:
+if texts and q_name and api_key:
         st.markdown(f'**設問名：** {q_name}')
         st.markdown(f'**回答数：** {len(texts)}件')
         st.markdown(f'**コード上限：** {max_codes}個')
