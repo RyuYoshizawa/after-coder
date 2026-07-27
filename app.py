@@ -556,7 +556,7 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
 # Streamlit UI
 # ══════════════════════════════════════════════════
 
-st.markdown('<p class="main-title">🤖 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">👻 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">アップロードした自由文回答テキストを自動でコーディングし集計します</p>', unsafe_allow_html=True)
 
 # ── サイドバー：設定 ──────────────────────────────
@@ -601,7 +601,7 @@ with st.sidebar:
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader('� データアップロード')
+    st.markdown('### � データアップロード')
     uploaded = st.file_uploader(
         'テキストファイルを選択（1行1回答）',
         type=['txt'],
@@ -619,7 +619,7 @@ with col1:
                 st.markdown(f'**{i}.** {t}')
 
 with col2:
-    st.subheader('� 分析設定の確認')
+    st.markdown('### ✅ 分析設定の確認')
     if uploaded and q_name and api_key:
         st.markdown(f'**設問名：** {q_name}')
         st.markdown(f'**回答数：** {len(texts)}件')
