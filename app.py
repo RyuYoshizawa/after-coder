@@ -42,8 +42,8 @@ st.markdown("""
 # ══════════════════════════════════════════════════
 
 USERS = {
-    'user01': 'pass01',
-    'user02': 'pass02',
+    'starangler': 'QWEp12a23#',
+    'mjguest': 'Amazonet1997',
 }
 ADMIN_USERNAME = 'admin'
 ADMIN_PASSWORD = 'admin_pass_2026'  # 本番運用前に変更してください
