@@ -641,17 +641,15 @@ with col1:
 
 with col2:
     st.markdown('### ✅ 分析設定の確認')
-if texts and q_name and api_key:
+    if texts and q_name and api_key:
         st.markdown(f'**設問名：** {q_name}')
         st.markdown(f'**回答数：** {len(texts)}件')
         st.markdown(f'**コード上限：** {max_codes}個')
         st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
-
         est_min = max(3, len(texts) // 100 * 2)
         st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
     else:
         st.info('左サイドバーで設定を入力し、ファイルをアップロードしてください。')
-
 st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
