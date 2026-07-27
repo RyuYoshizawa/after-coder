@@ -38,6 +38,54 @@ st.markdown("""
 
 
 # ══════════════════════════════════════════════════
+# 認証
+# ══════════════════════════════════════════════════
+
+USERS = {
+    'user01': 'pass01',
+    'user02': 'pass02',
+}
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD = 'admin_pass_2026'  # 本番運用前に変更してください
+
+
+def authenticate(username, password):
+    if username == ADMIN_USERNAME:
+        return password == ADMIN_PASSWORD
+    return USERS.get(username) == password
+
+
+st.session_state.setdefault('authenticated', False)
+st.session_state.setdefault('username', None)
+st.session_state.setdefault('history', [])
+st.session_state.setdefault('history_counter', 0)
+st.session_state.setdefault('active_history_id', None)
+
+
+def render_login():
+    st.markdown('<p class="main-title">👻 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-title">ログインしてください</p>', unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1, 1])
+    with mid:
+        with st.form('login_form'):
+            username = st.text_input('ユーザーID')
+            password = st.text_input('パスワード', type='password')
+            submitted = st.form_submit_button('ログイン', type='primary', width='stretch')
+            if submitted:
+                if authenticate(username, password):
+                    st.session_state.authenticated = True
+                    st.session_state.username = username
+                    st.rerun()
+                else:
+                    st.error('ユーザーIDまたはパスワードが正しくありません')
+
+
+if not st.session_state.authenticated:
+    render_login()
+    st.stop()
+
+
+# ══════════════════════════════════════════════════
 # LLM処理関数
 # ══════════════════════════════════════════════════
 
@@ -563,6 +611,7 @@ st.markdown('<p class="sub-title">アップロードした自由文回答テキ�
 with st.sidebar:
     st.markdown('# After Coder')
     st.markdown('*by Marketing Junction*')
+    st.caption(f'👤 ログイン中: {st.session_state.username}')
     st.divider()
     st.header('⚙️ 設定')
     api_key = st.text_input(
@@ -596,6 +645,30 @@ with st.sidebar:
 4. 「分析開始」をクリック
 5. 結果を確認してExcelをダウンロード
     ''')
+
+    st.divider()
+    st.markdown('**📜 作業履歴**')
+    if st.session_state.history:
+        for h in reversed(st.session_state.history[-10:]):
+            ts    = h['timestamp'].strftime('%m/%d %H:%M')
+            label = h['q_name'] if len(h['q_name']) <= 18 else h['q_name'][:18] + '…'
+            active = h['id'] == st.session_state.active_history_id
+            if st.button(
+                f"{'▶ ' if active else ''}{ts}　{label}",
+                key=f"hist_btn_{h['id']}",
+                width='stretch',
+                type='primary' if active else 'secondary',
+            ):
+                st.session_state.active_history_id = h['id']
+                st.rerun()
+    else:
+        st.caption('まだ分析履歴がありません')
+
+    st.divider()
+    if st.button('🚪 ログアウト', width='stretch'):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
 # ── メインエリア ──────────────────────────────────
 col1, col2 = st.columns([1, 1])
@@ -666,12 +739,28 @@ if st.button('🚀 分析開始', type='primary', use_container_width=True,
         )
 
     if result:
-        st.session_state['result'] = result
-        st.session_state['q_name'] = q_name
+        st.session_state.history_counter += 1
+        hist_entry = {
+            'id':        st.session_state.history_counter,
+            'q_name':    q_name,
+            'timestamp': datetime.now(),
+            'result':    result,
+        }
+        st.session_state.history.append(hist_entry)
+        st.session_state.history = st.session_state.history[-10:]
+        st.session_state.active_history_id = hist_entry['id']
 
-if 'result' in st.session_state:
-    result = st.session_state['result']
-    q_name = st.session_state.get('q_name', q_name)
+active_result = None
+active_q_name = None
+for h in st.session_state.history:
+    if h['id'] == st.session_state.active_history_id:
+        active_result = h['result']
+        active_q_name = h['q_name']
+        break
+
+if active_result:
+    result = active_result
+    q_name = active_q_name
     if True:
         st.success('✅ 分析が完了しました！')
 
