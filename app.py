@@ -602,21 +602,42 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.markdown('### ⬆️ データアップロード')
-    uploaded = st.file_uploader(
-        'テキストファイルを選択（1行1回答）',
-        type=['txt'],
-        help='UTF-8形式のテキストファイル。1行に1つの回答を記入してください。'
+
+    input_method = st.radio(
+        '入力方法を選択',
+        ['📄 ファイルをアップロード', '📋 テキストを直接貼り付け'],
+        horizontal=True
     )
 
-    if uploaded:
-        content = uploaded.read().decode('utf-8', errors='ignore')
-        texts   = [line.strip() for line in content.splitlines() if line.strip()]
-        st.success(f'✅ {len(texts)}件の回答を読み込みました')
+    texts = []
 
-        # プレビュー
-        with st.expander('回答プレビュー（先頭5件）'):
-            for i, t in enumerate(texts[:5], 1):
-                st.markdown(f'**{i}.** {t}')
+    if input_method == '📄 ファイルをアップロード':
+        uploaded = st.file_uploader(
+            'テキストファイルを選択（1行1回答）',
+            type=['txt'],
+            help='UTF-8形式のテキストファイル。1行に1つの回答を記入してください。'
+        )
+        if uploaded:
+            content = uploaded.read().decode('utf-8', errors='ignore')
+            texts   = [line.strip() for line in content.splitlines() if line.strip()]
+            st.success(f'✅ {len(texts)}件の回答を読み込みました')
+            with st.expander('回答プレビュー（先頭5件）'):
+                for i, t in enumerate(texts[:5], 1):
+                    st.markdown(f'**{i}.** {t}')
+
+    else:
+        pasted = st.text_area(
+            'テキストを貼り付け（1行1回答）',
+            height=200,
+            placeholder='例：\n対応が丁寧で安心できた\n待ち時間が長かった\n先生の説明がわかりやすかった',
+            help='1行に1つの回答を入力してください。空行は自動的に除外されます。'
+        )
+        if pasted:
+            texts = [line.strip() for line in pasted.splitlines() if line.strip()]
+            st.success(f'✅ {len(texts)}件の回答を読み込みました')
+            with st.expander('回答プレビュー（先頭5件）'):
+                for i, t in enumerate(texts[:5], 1):
+                    st.markdown(f'**{i}.** {t}')
 
 with col2:
     st.markdown('### ✅ 分析設定の確認')
