@@ -601,7 +601,7 @@ with st.sidebar:
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.markdown('### 📂 データアップロード')
+    st.markdown('### ⬆️ データアップロード')
     uploaded = st.file_uploader(
         'テキストファイルを選択（1行1回答）',
         type=['txt'],
