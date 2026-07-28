@@ -257,6 +257,33 @@ def llm_extract_topics(client, items, q_name, data_context=''):
     return []
 
 
+def llm_reduce_topics(client, topics, q_name, data_context=''):
+    """（方式C用）主題リストのチャンクを、同義・類似表現をまとめて簡潔なユニークリストに整理する"""
+    topics_text = '\n'.join(f'- {t}' for t in topics)
+    context_str = f'\n【調査の背景・特徴】\n{data_context}\n' if data_context.strip() else ''
+    prompt = f"""「{q_name}」の回答から抽出された主題リスト（{len(topics)}件）を整理してください。
+{context_str}
+【主題リスト】
+{topics_text}
+
+【ルール】
+- 同義・類似する主題はひとつにまとめる
+- 表現はできるだけ簡潔な短いフレーズにする
+- 異なる主題の情報を失わないよう、まとめすぎない"""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'topics': {'type': 'array', 'items': {'type': 'string'}}
+        },
+        'required': ['topics'],
+    }
+    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    if result and isinstance(result, dict):
+        return result.get('topics', [])
+    return topics  # 失敗時は元のチャンクをそのまま返し情報を失わない
+
+
 def llm_consolidate_topics(client, topics, max_codes, q_name, data_context=''):
     """（方式C用）全件から蓄積した主題リストを統合し、定義・キーワード付きのコードブックを確定"""
     topics_text = '\n'.join(f'- {t}' for t in topics)
@@ -780,9 +807,27 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
         progress_bar.progress(min(0.05 + 0.20 * ((bi+1) / len(batches)), 0.25))
 
     topics_dedup = list(dict.fromkeys(topics_all))
+
+    # 主題数が多すぎると最終統合コールが一括で処理しきれず失敗しやすいため、
+    # チャンクごとにLLMで類似表現をまとめ、段階的に件数を減らしてから最終統合に渡す
+    REDUCE_THRESHOLD = 300
+    REDUCE_CHUNK = 200
+    reduce_round = 1
+    while len(topics_dedup) > REDUCE_THRESHOLD:
+        status_text.markdown(f'**Step 1/3** 主題リストを整理中...（{len(topics_dedup)}件、{reduce_round}回目）')
+        chunks  = [topics_dedup[i:i+REDUCE_CHUNK] for i in range(0, len(topics_dedup), REDUCE_CHUNK)]
+        reduced = []
+        for chunk in chunks:
+            reduced.extend(llm_reduce_topics(client, chunk, q_name, data_context))
+        new_dedup = list(dict.fromkeys(reduced))
+        if len(new_dedup) >= len(topics_dedup):
+            break  # これ以上減らない場合は打ち切り、現状のリストで最終統合に進む
+        topics_dedup = new_dedup
+        reduce_round += 1
+
     status_text.markdown(
         f'**Step 1/3** 主題リストを統合してコードブックを確定中...'
-        f'（{len(topics_all)}件 → 重複除去後{len(topics_dedup)}件）'
+        f'（{len(topics_all)}件 → 整理後{len(topics_dedup)}件）'
     )
     codebook = llm_consolidate_topics(client, topics_dedup, max_codes, q_name, data_context)
     progress_bar.progress(0.30)
