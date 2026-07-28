@@ -94,7 +94,7 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
     }
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0,
         tools=[tool],
         tool_choice={'type': 'any'},
@@ -104,6 +104,11 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
         'input':  response.usage.input_tokens,
         'output': response.usage.output_tokens,
     }
+    if response.stop_reason == 'max_tokens':
+        raise RuntimeError(
+            f'出力がmax_tokens上限で打ち切られました（入力{usage["input"]}トークン/出力{usage["output"]}トークン）。'
+            'データ量やコード数上限を減らすか、分割して再実行してください。'
+        )
     for block in response.content:
         if block.type == 'tool_use' and block.name == 'output_result':
             return block.input, usage
@@ -127,7 +132,7 @@ def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
     }
     response = client.chat.completions.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0,
         tools=[tool],
         tool_choice='auto',
@@ -137,6 +142,11 @@ def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
         'input':  response.usage.prompt_tokens,
         'output': response.usage.completion_tokens,
     }
+    if response.choices[0].finish_reason == 'length':
+        raise RuntimeError(
+            f'出力がmax_tokens上限で打ち切られました（入力{usage["input"]}トークン/出力{usage["output"]}トークン）。'
+            'データ量やコード数上限を減らすか、分割して再実行してください。'
+        )
     msg = response.choices[0].message
     if msg.tool_calls:
         for tc in msg.tool_calls:

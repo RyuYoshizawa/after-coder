@@ -779,8 +779,12 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
         topics_all.extend(llm_extract_topics(client, batch, q_name, data_context))
         progress_bar.progress(min(0.05 + 0.20 * ((bi+1) / len(batches)), 0.25))
 
-    status_text.markdown('**Step 1/3** 主題リストを統合してコードブックを確定中...')
-    codebook = llm_consolidate_topics(client, topics_all, max_codes, q_name, data_context)
+    topics_dedup = list(dict.fromkeys(topics_all))
+    status_text.markdown(
+        f'**Step 1/3** 主題リストを統合してコードブックを確定中...'
+        f'（{len(topics_all)}件 → 重複除去後{len(topics_dedup)}件）'
+    )
+    codebook = llm_consolidate_topics(client, topics_dedup, max_codes, q_name, data_context)
     progress_bar.progress(0.30)
     return codebook
 
