@@ -52,13 +52,18 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
     """
     global _last_error
     last_reason = None
+    # 1回目は再現性のためtemperature=0固定。空結果で失敗した場合、
+    # 同一プロンプト×temperature=0では毎回同じ結果になり得るため、
+    # リトライ時は少しずつtemperatureを上げて出力にばらつきを持たせる
+    temperatures = [0, 0.4, 0.7]
 
     for attempt in range(3):
         try:
+            temperature = temperatures[attempt]
             if provider == 'Anthropic':
-                result, usage = _call_anthropic(client, prompt, schema, model)
+                result, usage = _call_anthropic(client, prompt, schema, model, temperature)
             elif provider == 'OpenAI':
-                result, usage = _call_openai(client, prompt, schema, model)
+                result, usage = _call_openai(client, prompt, schema, model, temperature)
             else:
                 raise ValueError(f'未対応のプロバイダ: {provider}')
 
@@ -85,7 +90,7 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
     return None
 
 
-def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
+def _call_anthropic(client, prompt: str, schema: dict, model: str, temperature: float = 0) -> tuple:
     """Anthropic tool_use を使った構造化呼び出し"""
     tool = {
         'name': 'output_result',
@@ -95,9 +100,9 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
     response = client.messages.create(
         model=model,
         max_tokens=8192,
-        temperature=0,
+        temperature=temperature,
         tools=[tool],
-        tool_choice={'type': 'any'},
+        tool_choice={'type': 'tool', 'name': 'output_result'},
         messages=[{'role': 'user', 'content': prompt}]
     )
     usage = {
@@ -120,7 +125,7 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
     return None, usage
 
 
-def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
+def _call_openai(client, prompt: str, schema: dict, model: str, temperature: float = 0) -> tuple:
     """OpenAI function_calling を使った構造化呼び出し"""
     tool = {
         'type': 'function',
@@ -133,9 +138,9 @@ def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
     response = client.chat.completions.create(
         model=model,
         max_tokens=8192,
-        temperature=0,
+        temperature=temperature,
         tools=[tool],
-        tool_choice='auto',
+        tool_choice={'type': 'function', 'function': {'name': 'output_result'}},
         messages=[{'role': 'user', 'content': prompt}]
     )
     usage = {
