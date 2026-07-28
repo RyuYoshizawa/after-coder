@@ -44,6 +44,8 @@ st.markdown("""
 USERS = {
     'starangler': 'QWEp12a23#',
     'mjguest': 'Amazonet1997',
+    'KonomiSenda': 'Amazonet3944',
+    'KunikoOkazaki': 'Mj3944',
 }
 ADMIN_USERNAME = 'admin'
 ADMIN_PASSWORD = 'admin_pass_2026'  # 本番運用前に変更してください
