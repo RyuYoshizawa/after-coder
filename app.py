@@ -810,10 +810,10 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
         codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
 
     if not codebook:
-        reason = get_last_error()
+        reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
         st.error(
             'コードブック生成に失敗しました。再度お試しください。'
-            + (f'\n\n詳細: {reason}' if reason else '')
+            + f'\n\n詳細: {reason}'
         )
         return None
 

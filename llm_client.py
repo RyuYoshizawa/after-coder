@@ -66,11 +66,14 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
                 _token_usage['input']  += usage.get('input', 0)
                 _token_usage['output'] += usage.get('output', 0)
 
-            if result is not None:
+            if result:
                 _last_error = None
                 return result
 
-            last_reason = 'モデルが構造化データを返しませんでした（tool_use/JSON抽出とも失敗）'
+            if result is None:
+                last_reason = 'モデルが構造化データを返しませんでした（tool_use/JSON抽出とも失敗）'
+            else:
+                last_reason = f'モデルが空の結果を返しました（{result!r}）'
 
         except Exception as e:
             last_reason = f'{type(e).__name__}: {e}'
