@@ -15,7 +15,7 @@ from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
-from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, calc_cost_jpy
+from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, calc_cost_jpy, get_last_error
 
 APP_DIR = Path(__file__).parent
 
@@ -176,7 +176,7 @@ def llm_generate_codebook_topdown(client, data_context, q_name, max_codes):
 def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, data_context=''):
     """（方式B用）トップダウン骨格を実データサンプルで具体化し、定義を付与したコードブックを確定"""
     skeleton_text = '\n'.join(
-        f'{cat["cat_id"]}: {cat["cat_name"]} → ' + '、'.join(cat.get('expected_codes', []))
+        f'{cat.get("cat_id", "")}: {cat.get("cat_name", "")} → ' + '、'.join(cat.get('expected_codes', []) or [])
         for cat in skeleton.get('categories', [])
     )
     sample_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in sample_items)
@@ -810,7 +810,11 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
         codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
 
     if not codebook:
-        st.error('コードブック生成に失敗しました。再度お試しください。')
+        reason = get_last_error()
+        st.error(
+            'コードブック生成に失敗しました。再度お試しください。'
+            + (f'\n\n詳細: {reason}' if reason else '')
+        )
         return None
 
     # コードをフラットリストに

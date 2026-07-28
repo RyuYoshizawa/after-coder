@@ -21,6 +21,14 @@ def get_token_usage() -> dict:
     """現在のトークン使用量を返す"""
     return dict(_token_usage)
 
+
+# 直近の呼び出し失敗理由（call_llmがNoneを返した際にUI側で原因表示するために使う）
+_last_error = None
+
+def get_last_error() -> str | None:
+    """call_llmが直近でNoneを返した理由（例外メッセージ）を返す"""
+    return _last_error
+
 def calc_cost_jpy(input_tokens: int, output_tokens: int, model: str) -> float:
     """
     概算コストを円で返す（1USD=150円換算）
@@ -42,6 +50,9 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
     tool_use / function_calling → 失敗時はJSONフォールバックの順で試みる。
     トークン使用量をグローバルカウンターに累積する。
     """
+    global _last_error
+    last_reason = None
+
     for attempt in range(3):
         try:
             if provider == 'Anthropic':
@@ -56,13 +67,18 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
                 _token_usage['output'] += usage.get('output', 0)
 
             if result is not None:
+                _last_error = None
                 return result
 
+            last_reason = 'モデルが構造化データを返しませんでした（tool_use/JSON抽出とも失敗）'
+
         except Exception as e:
-            print(f'\n  [リトライ{attempt+1}] {type(e).__name__}: {e}')
+            last_reason = f'{type(e).__name__}: {e}'
+            print(f'\n  [リトライ{attempt+1}] {last_reason}')
             time.sleep(1)
 
-    print('\n  [警告] 構造化出力に失敗しました。このバッチをスキップします。')
+    _last_error = last_reason
+    print(f'\n  [警告] 構造化出力に失敗しました。このバッチをスキップします。理由: {last_reason}')
     return None
 
 
