@@ -76,6 +76,7 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str) -> tuple:
     response = client.messages.create(
         model=model,
         max_tokens=4096,
+        temperature=0,
         tools=[tool],
         tool_choice={'type': 'any'},
         messages=[{'role': 'user', 'content': prompt}]
@@ -108,6 +109,7 @@ def _call_openai(client, prompt: str, schema: dict, model: str) -> tuple:
     response = client.chat.completions.create(
         model=model,
         max_tokens=4096,
+        temperature=0,
         tools=[tool],
         tool_choice='auto',
         messages=[{'role': 'user', 'content': prompt}]

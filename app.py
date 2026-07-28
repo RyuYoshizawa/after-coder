@@ -62,6 +62,7 @@ st.session_state.setdefault('username', None)
 st.session_state.setdefault('history', [])
 st.session_state.setdefault('history_counter', 0)
 st.session_state.setdefault('active_history_id', None)
+st.session_state.setdefault('texts_count', 0)
 
 
 def render_login():
@@ -123,6 +124,175 @@ def llm_generate_codebook(client, items, max_codes, q_name, data_context=''):
                                     'code_id':    {'type': 'string'},
                                     'code_name':  {'type': 'string'},
                                     'definition': {'type': 'string'},
+                                },
+                                'required': ['code_id', 'code_name', 'definition'],
+                            }
+                        }
+                    },
+                    'required': ['cat_id', 'cat_name', 'codes'],
+                }
+            }
+        },
+        'required': ['categories'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+
+
+def llm_generate_codebook_topdown(client, data_context, q_name, max_codes):
+    """（方式B用）実データを見る前に、調査の背景・特徴だけからカテゴリ骨格を生成"""
+    prompt = f"""「{q_name}」の自由回答について、実際の回答データを見る前に、
+調査の背景・特徴だけから想定されるコードブックの骨格（カテゴリと想定コード名）を作成してください。
+
+【調査の背景・特徴】
+{data_context}
+
+【ルール】
+- 中間カテゴリ7個前後（最大10個）
+- カテゴリごとに想定コード名を列挙（1カテゴリあたり最大10個、総数{max_codes}個以内）
+- コードIDは不要、コード名のみ列挙
+- カテゴリIDはCAT01形式"""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'categories': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'cat_id':         {'type': 'string'},
+                        'cat_name':       {'type': 'string'},
+                        'expected_codes': {'type': 'array', 'items': {'type': 'string'}},
+                    },
+                    'required': ['cat_id', 'cat_name', 'expected_codes'],
+                }
+            }
+        },
+        'required': ['categories'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+
+
+def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, data_context=''):
+    """（方式B用）トップダウン骨格を実データサンプルで具体化し、定義を付与したコードブックを確定"""
+    skeleton_text = '\n'.join(
+        f'{cat["cat_id"]}: {cat["cat_name"]} → ' + '、'.join(cat.get('expected_codes', []))
+        for cat in skeleton.get('categories', [])
+    )
+    sample_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in sample_items)
+    context_str = f'\n【調査の背景・特徴】\n{data_context}\n' if data_context.strip() else ''
+    prompt = f"""「{q_name}」のコードブックを確定してください。
+以下は調査の背景から事前に想定したカテゴリ骨格です。骨格のカテゴリ構成（cat_id・cat_name）は維持しながら、
+実際の回答サンプルを踏まえて各コードに定義を付与し、必要に応じてコードを追加・調整してください。
+
+【カテゴリ骨格（トップダウンで抽出した想定コード）】
+{skeleton_text}
+{context_str}
+【実際の回答サンプル（{len(sample_items)}件）】
+{sample_text}
+
+【ルール】
+- 骨格のカテゴリ（cat_id・cat_name）は維持する
+- 想定コードに定義を付与する（サンプルに現れない想定コードも残してよい）
+- サンプルに現れる主題で骨格にないものは追加する（総数{max_codes}個以内）
+- 1コード＝1主題
+- コードID形式: CAT01.../C0101..."""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'categories': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'cat_id':   {'type': 'string'},
+                        'cat_name': {'type': 'string'},
+                        'codes': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'code_id':    {'type': 'string'},
+                                    'code_name':  {'type': 'string'},
+                                    'definition': {'type': 'string'},
+                                },
+                                'required': ['code_id', 'code_name', 'definition'],
+                            }
+                        }
+                    },
+                    'required': ['cat_id', 'cat_name', 'codes'],
+                }
+            }
+        },
+        'required': ['categories'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+
+
+def llm_extract_topics(client, items, q_name, data_context=''):
+    """（方式C用）回答バッチから主題（トピック）を網羅的に抽出"""
+    text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
+    context_str = f'\n【調査の背景・特徴】\n{data_context}\n' if data_context.strip() else ''
+    prompt = f"""「{q_name}」の回答（{len(items)}件）に含まれる主題（トピック）をすべて抽出してください。
+{context_str}
+【ルール】
+- 回答ごとに1つ以上の主題を短いフレーズで抽出する
+- 似た内容は同じ表現にまとめてよい
+- 網羅性を優先し、細かい主題も漏らさず列挙する
+
+【回答リスト】
+{text}"""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'topics': {'type': 'array', 'items': {'type': 'string'}}
+        },
+        'required': ['topics'],
+    }
+    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    if result and isinstance(result, dict):
+        return result.get('topics', [])
+    return []
+
+
+def llm_consolidate_topics(client, topics, max_codes, q_name, data_context=''):
+    """（方式C用）全件から蓄積した主題リストを統合し、定義・キーワード付きのコードブックを確定"""
+    topics_text = '\n'.join(f'- {t}' for t in topics)
+    context_str = f'\n【調査の背景・特徴】\n{data_context}\n' if data_context.strip() else ''
+    prompt = f"""「{q_name}」の全回答から抽出された主題リスト（{len(topics)}件、類似表現含む）を統合し、
+最終的なコードブックを確定してください。
+{context_str}
+【主題リスト】
+{topics_text}
+
+【ルール】
+- 類似・重複する主題を統合し、中間カテゴリ7個前後（最大10個）に整理する
+- カテゴリ内コード最大10個、総数{max_codes}個以内
+- 1コード＝1主題
+- 各コードに定義と、判定に役立つキーワードを2〜5個付与する
+- コードID形式: CAT01.../C0101..."""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'categories': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'cat_id':   {'type': 'string'},
+                        'cat_name': {'type': 'string'},
+                        'codes': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'code_id':    {'type': 'string'},
+                                    'code_name':  {'type': 'string'},
+                                    'definition': {'type': 'string'},
+                                    'keywords':   {'type': 'array', 'items': {'type': 'string'}},
                                 },
                                 'required': ['code_id', 'code_name', 'definition'],
                             }
@@ -515,31 +685,39 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
     return buf.getvalue()
 
 # ══════════════════════════════════════════════════
-# メイン処理
+# コードブック策定方式（A/B/C）
 # ══════════════════════════════════════════════════
 
-def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context=''):
-    """コードブック策定→全件コーディング→集計を実行"""
+CODEBOOK_MODES = [
+    {
+        'code':  'A',
+        'label': '方式A：標準',
+        'desc':  '少量サンプル（30件）でコードブックを生成し差分検出\n\n'
+                 '速度：速い／コスト：低／精度：標準\n\n推奨：〜500件',
+    },
+    {
+        'code':  'B',
+        'label': '方式B：トップダウン＋ボトムアップ（推奨）',
+        'desc':  '「分析データの特徴」欄からコードの骨格を先に生成し、骨格を土台にボトムアップの差分検出を実施\n\n'
+                 '「分析データの特徴」が空の場合は方式Aにフォールバック\n\n'
+                 '速度：標準／コスト：標準／精度：高\n\n推奨：500〜2000件',
+    },
+    {
+        'code':  'C',
+        'label': '方式C：全件精査',
+        'desc':  '全件を30件ずつ読んで主題リストを抽出・蓄積し、主題リストを統合してコードブックを確定。定義・キーワードを付与\n\n'
+                 '速度：遅い／コスト：高／精度：最高\n\n推奨：2000件〜',
+    },
+]
+CODEBOOK_MODE_LABELS = [m['label'] for m in CODEBOOK_MODES]
+CODEBOOK_MODE_DESC   = {m['label']: m['desc'] for m in CODEBOOK_MODES}
+CODEBOOK_MODE_CODE   = {m['label']: m['code'] for m in CODEBOOK_MODES}
 
-    reset_token_usage()
-    client = make_client('Anthropic', api_key)
-    all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
-    random.shuffle(all_items)
-    total = len(all_items)
 
-    # ── Step1: コードブック策定 ──────────────────────────────────
-    status_text.markdown('**Step 1/3** コードブックを生成中...')
-    progress_bar.progress(0.05)
-
-    sample_1   = all_items[:30]
-    codebook   = llm_generate_codebook(client, sample_1, max_codes, q_name, data_context)
-    if not codebook:
-        st.error('コードブック生成に失敗しました。再度お試しください。')
-        return None
-
-    # 差分検出（残りを20件ずつ）
-    remaining = all_items[30:]
-    round_no  = 2
+def _diff_detect_loop(client, codebook, remaining, max_codes, q_name, progress_bar, p_start=0.05, p_end=0.30):
+    """既存コードブックに対し残りサンプルをバッチ処理し新規コードを差分検出する（方式A・Bで共用）"""
+    total_batches = max(len(remaining) // 20, 1)
+    round_no = 2
     while remaining:
         batch     = remaining[:20]
         remaining = remaining[20:]
@@ -557,8 +735,83 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
         cur = sum(len(c['codes']) for c in codebook.get('categories', []))
         if cur >= max_codes:
             break
-        progress_bar.progress(min(0.05 + 0.25 * (round_no / max(len(all_items)//20, 1)), 0.30))
+        progress_bar.progress(min(p_start + (p_end - p_start) * (round_no / total_batches), p_end))
         round_no += 1
+    return codebook
+
+
+def _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar):
+    """方式A：標準 - 少量サンプルでコードブックを生成し差分検出"""
+    sample_1 = all_items[:30]
+    codebook = llm_generate_codebook(client, sample_1, max_codes, q_name, data_context)
+    if not codebook:
+        return None
+    return _diff_detect_loop(client, codebook, all_items[30:], max_codes, q_name, progress_bar)
+
+
+def _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text):
+    """方式B：トップダウン＋ボトムアップ - 骨格を先に生成し実データで具体化・差分検出"""
+    if not data_context.strip():
+        status_text.markdown('**Step 1/3** 「分析データの特徴」が未入力のため方式Aで生成します...')
+        return _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
+
+    status_text.markdown('**Step 1/3** トップダウンで骨格を生成中...')
+    skeleton = llm_generate_codebook_topdown(client, data_context, q_name, max_codes)
+    if not skeleton:
+        return None
+    progress_bar.progress(0.10)
+
+    status_text.markdown('**Step 1/3** 実データで骨格を具体化中...')
+    codebook = llm_elaborate_skeleton(client, skeleton, all_items[:30], max_codes, q_name, data_context)
+    if not codebook:
+        return None
+    progress_bar.progress(0.20)
+
+    return _diff_detect_loop(client, codebook, all_items[30:], max_codes, q_name, progress_bar, p_start=0.20, p_end=0.30)
+
+
+def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text):
+    """方式C：全件精査 - 全件から主題を抽出・蓄積し統合してコードブックを確定"""
+    batches    = [all_items[i:i+30] for i in range(0, len(all_items), 30)]
+    topics_all = []
+    for bi, batch in enumerate(batches):
+        status_text.markdown(f'**Step 1/3** 主題抽出中... {bi+1}/{len(batches)}バッチ')
+        topics_all.extend(llm_extract_topics(client, batch, q_name, data_context))
+        progress_bar.progress(min(0.05 + 0.20 * ((bi+1) / len(batches)), 0.25))
+
+    status_text.markdown('**Step 1/3** 主題リストを統合してコードブックを確定中...')
+    codebook = llm_consolidate_topics(client, topics_all, max_codes, q_name, data_context)
+    progress_bar.progress(0.30)
+    return codebook
+
+
+# ══════════════════════════════════════════════════
+# メイン処理
+# ══════════════════════════════════════════════════
+
+def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='', codebook_mode='A'):
+    """コードブック策定→全件コーディング→集計を実行"""
+
+    reset_token_usage()
+    client = make_client('Anthropic', api_key)
+    all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
+    random.shuffle(all_items)
+    total = len(all_items)
+
+    # ── Step1: コードブック策定 ──────────────────────────────────
+    status_text.markdown('**Step 1/3** コードブックを生成中...')
+    progress_bar.progress(0.05)
+
+    if codebook_mode == 'B':
+        codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
+    elif codebook_mode == 'C':
+        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
+    else:
+        codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
+
+    if not codebook:
+        st.error('コードブック生成に失敗しました。再度お試しください。')
+        return None
 
     # コードをフラットリストに
     codes = [
@@ -638,6 +891,23 @@ with st.sidebar:
         min_value=10, max_value=49, value=30, step=1,
         help='生成するコードの最大数（推奨：20〜35）'
     )
+
+    st.markdown('**📐 コードブック策定方式**')
+    codebook_mode_label = st.radio(
+        'コードブック策定方式',
+        CODEBOOK_MODE_LABELS,
+        index=1,
+        label_visibility='collapsed',
+    )
+    st.caption(CODEBOOK_MODE_DESC[codebook_mode_label])
+    codebook_mode = CODEBOOK_MODE_CODE[codebook_mode_label]
+
+    n_texts = st.session_state.texts_count
+    if n_texts >= 2000 and codebook_mode != 'C':
+        st.info(f'📊 {n_texts}件のデータには方式Cを推奨します')
+    elif n_texts >= 500 and codebook_mode == 'A':
+        st.info(f'📊 {n_texts}件のデータには方式B以上を推奨します')
+
     st.divider()
     st.markdown('**📖 使い方**')
     st.markdown('''
@@ -714,12 +984,17 @@ with col1:
                 for i, t in enumerate(texts[:5], 1):
                     st.markdown(f'**{i}.** {t}')
 
+if st.session_state.texts_count != len(texts):
+    st.session_state.texts_count = len(texts)
+    st.rerun()
+
 with col2:
     st.markdown('### ✅ 分析設定の確認')
     if texts and q_name and api_key:
         st.markdown(f'**設問名：** {q_name}')
         st.markdown(f'**回答数：** {len(texts)}件')
         st.markdown(f'**コード上限：** {max_codes}個')
+        st.markdown(f'**策定方式：** {codebook_mode_label}')
         st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
         est_min = max(3, len(texts) // 100 * 2)
         st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
@@ -737,7 +1012,7 @@ if st.button('🚀 分析開始', type='primary', use_container_width=True,
     with st.spinner('分析中...'):
         result = run_analysis(
             api_key, q_name, texts, max_codes,
-            progress_bar, status_text, data_context
+            progress_bar, status_text, data_context, codebook_mode
         )
 
     if result:
