@@ -5,6 +5,7 @@ Streamlit Webアプリ
 
 import streamlit as st
 import anthropic
+import hashlib
 import json
 import re
 import time
@@ -797,39 +798,96 @@ def _build_codebook_b(client, all_items, max_codes, q_name, data_context, progre
     return _diff_detect_loop(client, codebook, all_items[30:], max_codes, q_name, progress_bar, p_start=0.20, p_end=0.30)
 
 
-def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text):
-    """方式C：全件精査 - 全件から主題を抽出・蓄積し統合してコードブックを確定"""
-    batches    = [all_items[i:i+30] for i in range(0, len(all_items), 30)]
+def _topics_cache_key(all_items, q_name, data_context):
+    """方式Cのキャッシュキー。回答内容・設問名・分析データの特徴が同じなら同一キーになる（回答順序は無視）"""
+    texts = sorted(x['text'] for x in all_items)
+    src = q_name + '␟' + data_context + '␟' + '␞'.join(texts)
+    return hashlib.sha256(src.encode('utf-8')).hexdigest()
+
+
+def _build_codebook_c_stage1(client, stage1_items, max_codes, q_name, data_context, progress_bar, status_text):
+    """方式C Stage1：ランダム抽出した一部から主題抽出→統合し初期コードブックを作る"""
+    batches    = [stage1_items[i:i+50] for i in range(0, len(stage1_items), 50)]
     topics_all = []
     for bi, batch in enumerate(batches):
-        status_text.markdown(f'**Step 1/3** 主題抽出中... {bi+1}/{len(batches)}バッチ')
+        status_text.markdown(f'**Step 1/3** Stage1（{len(stage1_items)}件）: 主題抽出中... {bi+1}/{len(batches)}バッチ')
         topics_all.extend(llm_extract_topics(client, batch, q_name, data_context))
-        progress_bar.progress(min(0.05 + 0.20 * ((bi+1) / len(batches)), 0.25))
+        progress_bar.progress(min(0.05 + 0.08 * ((bi+1) / len(batches)), 0.13))
 
     topics_dedup = list(dict.fromkeys(topics_all))
 
-    # 主題数が多すぎると最終統合コールが一括で処理しきれず失敗しやすいため、
-    # チャンクごとにLLMで類似表現をまとめ、段階的に件数を減らしてから最終統合に渡す
+    # 主題数が多いと統合コールが一括で処理しきれず失敗しやすいため、
+    # チャンクごとにLLMで類似表現をまとめ、段階的に件数を減らしてから統合に渡す
     REDUCE_THRESHOLD = 300
     REDUCE_CHUNK = 200
     reduce_round = 1
     while len(topics_dedup) > REDUCE_THRESHOLD:
-        status_text.markdown(f'**Step 1/3** 主題リストを整理中...（{len(topics_dedup)}件、{reduce_round}回目）')
+        status_text.markdown(f'**Step 1/3** Stage1: 主題リストを整理中...（{len(topics_dedup)}件、{reduce_round}回目）')
         chunks  = [topics_dedup[i:i+REDUCE_CHUNK] for i in range(0, len(topics_dedup), REDUCE_CHUNK)]
         reduced = []
         for chunk in chunks:
             reduced.extend(llm_reduce_topics(client, chunk, q_name, data_context))
         new_dedup = list(dict.fromkeys(reduced))
         if len(new_dedup) >= len(topics_dedup):
-            break  # これ以上減らない場合は打ち切り、現状のリストで最終統合に進む
+            break  # これ以上減らない場合は打ち切り、現状のリストで統合に進む
         topics_dedup = new_dedup
         reduce_round += 1
 
     status_text.markdown(
-        f'**Step 1/3** 主題リストを統合してコードブックを確定中...'
-        f'（{len(topics_all)}件 → 整理後{len(topics_dedup)}件）'
+        f'**Step 1/3** Stage1: 初期コードブックを確定中...（{len(topics_all)}件 → 整理後{len(topics_dedup)}件）'
     )
     codebook = llm_consolidate_topics(client, topics_dedup, max_codes, q_name, data_context)
+    progress_bar.progress(0.15)
+    return codebook
+
+
+def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text):
+    """
+    方式C：全件精査
+    Stage1: 全体の1/5をランダム抽出して主題抽出→統合し初期コードブックを作成
+    Stage2: 1/5→1/2に対象を拡大し、新規分だけ差分検出
+    Stage3: 1/2→全件に対象を拡大し、残り全件を差分検出
+    途中のステージまでの結果はセッション内でキャッシュし、後段の失敗時に前段からの
+    やり直しを避ける（同一データ・設問名・分析データの特徴の場合のみ再利用）。
+    """
+    cache_key   = _topics_cache_key(all_items, q_name, data_context)
+    stage_cache = st.session_state.setdefault('stage_codebook_cache', {})
+    cached      = stage_cache.get(cache_key)
+    stage_done  = cached['stage'] if cached else 0
+    codebook    = cached['codebook'] if cached else None
+
+    n1 = max(len(all_items) // 5, 1)
+    n2 = max(len(all_items) // 2, n1)
+
+    if stage_done >= 1:
+        status_text.markdown('**Step 1/3** Stage1: キャッシュ済みの初期コードブックを再利用...')
+        progress_bar.progress(0.15)
+    else:
+        codebook = _build_codebook_c_stage1(
+            client, all_items[:n1], max_codes, q_name, data_context, progress_bar, status_text
+        )
+        if not codebook:
+            return None
+        stage_done = 1
+        stage_cache[cache_key] = {'stage': 1, 'codebook': codebook}
+
+    if stage_done >= 2:
+        status_text.markdown('**Step 1/3** Stage2: キャッシュ済みの結果を再利用...')
+        progress_bar.progress(0.22)
+    else:
+        status_text.markdown(f'**Step 1/3** Stage2: 全体の1/2（{n2}件）まで対象を拡大し差分検出中...')
+        codebook = _diff_detect_loop(
+            client, codebook, all_items[n1:n2], max_codes, q_name, progress_bar, p_start=0.15, p_end=0.22
+        )
+        stage_done = 2
+        stage_cache[cache_key] = {'stage': 2, 'codebook': codebook}
+
+    status_text.markdown(f'**Step 1/3** Stage3: 残り全件（{len(all_items)-n2}件）を差分検出中...')
+    codebook = _diff_detect_loop(
+        client, codebook, all_items[n2:], max_codes, q_name, progress_bar, p_start=0.22, p_end=0.30
+    )
+    stage_cache[cache_key] = {'stage': 3, 'codebook': codebook}
+
     progress_bar.progress(0.30)
     return codebook
 

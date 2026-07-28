@@ -54,10 +54,11 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
     last_reason = None
     # 1回目は再現性のためtemperature=0固定。空結果で失敗した場合、
     # 同一プロンプト×temperature=0では毎回同じ結果になり得るため、
-    # リトライ時は少しずつtemperatureを上げて出力にばらつきを持たせる
-    temperatures = [0, 0.4, 0.7]
+    # リトライ時はtemperatureを上げて出力にばらつきを持たせる。
+    # 呼び出し回数が多い方式C等でのトークン消費を抑えるため試行は2回までとする。
+    temperatures = [0, 0.5]
 
-    for attempt in range(3):
+    for attempt in range(len(temperatures)):
         try:
             temperature = temperatures[attempt]
             if provider == 'Anthropic':
