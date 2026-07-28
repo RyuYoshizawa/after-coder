@@ -114,15 +114,30 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str, temperature: 
             f'出力がmax_tokens上限で打ち切られました（入力{usage["input"]}トークン/出力{usage["output"]}トークン）。'
             'データ量やコード数上限を減らすか、分割して再実行してください。'
         )
+
+    tool_input = None
+    text_parts = []
     for block in response.content:
         if block.type == 'tool_use' and block.name == 'output_result':
-            return block.input, usage
-    for block in response.content:
-        if block.type == 'text':
-            result = _parse_json_text(block.text)
-            if result is not None:
-                return result, usage
-    return None, usage
+            tool_input = block.input
+        elif block.type == 'text':
+            text_parts.append(block.text)
+
+    if tool_input:
+        return tool_input, usage
+
+    if text_parts:
+        result = _parse_json_text('\n'.join(text_parts))
+        if result:
+            return result, usage
+
+    # ここまで来た場合は空/無効な応答。原因診断のため詳細情報を添えて例外化する
+    # （tool_use自体が来ていない場合はNoneのまま、空の引数で来た場合は{}が入る）
+    preview = text_parts[0][:200] if text_parts else ''
+    raise RuntimeError(
+        f'空/無効な応答（stop_reason={response.stop_reason}, 出力{usage["output"]}トークン, '
+        f'tool_use入力={tool_input!r}, テキスト先頭200字={preview!r}）'
+    )
 
 
 def _call_openai(client, prompt: str, schema: dict, model: str, temperature: float = 0) -> tuple:
