@@ -432,16 +432,20 @@ def llm_code_batch(client, items, codes, q_name):
 # ══════════════════════════════════════════════════
 
 def aggregate_results(codes, results, total):
-    """コード別GT集計とセンチメント集計"""
+    """コード別GT集計とセンチメント集計・非該当（どのコードも付与されなかった回答）件数を算出"""
     code_counts = {c['code_id']: 0 for c in codes}
     sent_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
     result_map  = {r['id']: r for r in results}
+    unassigned  = 0
 
     for rid, res in result_map.items():
         sent = res.get('sentiment', 'neutral')
         if sent in sent_counts:
             sent_counts[sent] += 1
-        for cid in res.get('codes', []):
+        res_codes = res.get('codes', [])
+        if not res_codes:
+            unassigned += 1
+        for cid in res_codes:
             if cid in code_counts:
                 code_counts[cid] += 1
 
@@ -459,10 +463,10 @@ def aggregate_results(codes, results, total):
             'definition':cat.get('definition', ''),
         })
     gt.sort(key=lambda x: x['count'], reverse=True)
-    return gt, sent_counts
+    return gt, sent_counts, unassigned
 
 
-def create_excel(q_name, gt, sent_counts, total, results, items, codes):
+def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassigned=0):
     """ローカル版仮集計シートと同じレイアウトでExcelを生成"""
     wb  = openpyxl.Workbook()
     ws  = wb.active
@@ -513,7 +517,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
     FIXED_N    = 3   # 回答ID・回答テキスト・センチメントの3列
     CODE_START = FIXED_N + 1  # D列からコード開始
 
-    # ── センチメント集計（D5〜I6） ────────────────────────────────
+    # ── センチメント集計（D5〜K6） ────────────────────────────────
     ws.cell(row=4, column=1, value='■ センチメント集計').font = SUB_FONT
     sent_order = [('positive','ポジティブ'), ('negative','ネガティブ'), ('neutral','ニュートラル')]
     for i, (sent, label) in enumerate(sent_order):
@@ -523,6 +527,13 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
         dat(5, 5+i*2, cnt)
         hdr(6, 4+i*2, '%')
         dat(6, 5+i*2, round(pct, 1))
+
+    # 非該当（どのコードも付与されなかった回答）
+    un_pct = unassigned / total * 100 if total > 0 else 0
+    hdr(5, 4+len(sent_order)*2, '非該当（コードなし）')
+    dat(5, 5+len(sent_order)*2, unassigned)
+    hdr(6, 4+len(sent_order)*2, '%')
+    dat(6, 5+len(sent_order)*2, round(un_pct, 1))
 
     # ── GT集計（転置レイアウト） ──────────────────────────────────
     GT_START  = 8
@@ -655,7 +666,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
 
     # センチメント集計
     ws2.cell(row=4, column=1, value='■ センチメント集計').font = SUB_FONT
-    for i, (sent, label) in enumerate([('positive','ポジティブ'),('negative','ネガティブ'),('neutral','ニュートラル')]):
+    sent_order2 = [('positive','ポジティブ'),('negative','ネガティブ'),('neutral','ニュートラル')]
+    for i, (sent, label) in enumerate(sent_order2):
         cnt = sent_counts[sent]
         pct = cnt / total * 100 if total > 0 else 0
         c = ws2.cell(row=5, column=1+i*2, value=label)
@@ -666,6 +678,17 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes):
         c3.font=HDR_FONT; c3.fill=HDR_FILL; c3.border=BORDER
         c4 = ws2.cell(row=6, column=2+i*2, value=round(pct,1))
         c4.font=DATA_FONT; c4.border=BORDER
+
+    # 非該当（どのコードも付与されなかった回答）
+    un_pct = unassigned / total * 100 if total > 0 else 0
+    c = ws2.cell(row=5, column=1+len(sent_order2)*2, value='非該当（コードなし）')
+    c.font=HDR_FONT; c.fill=HDR_FILL; c.border=BORDER
+    c2 = ws2.cell(row=5, column=2+len(sent_order2)*2, value=unassigned)
+    c2.font=DATA_FONT; c2.border=BORDER
+    c3 = ws2.cell(row=6, column=1+len(sent_order2)*2, value='%')
+    c3.font=HDR_FONT; c3.fill=HDR_FILL; c3.border=BORDER
+    c4 = ws2.cell(row=6, column=2+len(sent_order2)*2, value=round(un_pct,1))
+    c4.font=DATA_FONT; c4.border=BORDER
 
     # GT集計（行方向・出現率順）
     ws2.cell(row=8, column=1, value='■ コード別GT集計').font = SUB_FONT
@@ -731,15 +754,34 @@ CODEBOOK_MODES = [
                  '速度：標準／コスト：標準／精度：高\n\n推奨：500〜2000件',
     },
     {
-        'code':  'C',
-        'label': '方式C：全件精査',
-        'desc':  '全件を30件ずつ読んで主題リストを抽出・蓄積し、主題リストを統合してコードブックを確定。定義・キーワードを付与\n\n'
-                 '速度：遅い／コスト：高／精度：最高\n\n推奨：2000件〜',
+        'code':  'C1',
+        'label': '方式C1：全件精査（1/4抽出）',
+        'desc':  '全体の1/4を主題抽出→統合して初期コードブックを作成し、残り3/4を差分検出\n\n'
+                 '速度：やや遅い／コスト：中〜高／精度：高\n\n推奨：2000件〜（C1〜C3で最も軽量）',
+    },
+    {
+        'code':  'C2',
+        'label': '方式C2：全件精査（ハーフ抽出）',
+        'desc':  '全体の1/2を主題抽出→統合して初期コードブックを作成し、残り1/2を差分検出\n\n'
+                 '速度：遅い／コスト：高／精度：高〜最高\n\n推奨：2000件〜',
+    },
+    {
+        'code':  'C3',
+        'label': '方式C3：全件精査（フル抽出）',
+        'desc':  '全件を主題抽出→統合してコードブックを確定（差分検出ステージなし）\n\n'
+                 '速度：最も遅い／コスト：最も高い／精度：最高\n\n推奨：精度を最優先したい場合',
+    },
+    {
+        'code':  'EXISTING',
+        'label': '既存のコードブックを使用（アップロード）',
+        'desc':  '以前ダウンロードしたコードブック（JSON）を指定し、コードブック生成をスキップして直接コーディングします\n\n'
+                 '速度：最速／コスト：最安（コーディングのみ実行）',
     },
 ]
 CODEBOOK_MODE_LABELS = [m['label'] for m in CODEBOOK_MODES]
 CODEBOOK_MODE_DESC   = {m['label']: m['desc'] for m in CODEBOOK_MODES}
 CODEBOOK_MODE_CODE   = {m['label']: m['code'] for m in CODEBOOK_MODES}
+CODEBOOK_MODE_C_RATIO = {'C1': 0.25, 'C2': 0.5, 'C3': 1.0}
 
 
 def _diff_detect_loop(client, codebook, remaining, max_codes, q_name, progress_bar, p_start=0.05, p_end=0.30):
@@ -841,27 +883,26 @@ def _build_codebook_c_stage1(client, stage1_items, max_codes, q_name, data_conte
     return codebook
 
 
-def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text):
+def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio=0.25):
     """
-    方式C：全件精査
-    Stage1: 全体の1/5をランダム抽出して主題抽出→統合し初期コードブックを作成
-    Stage2: 1/5→1/2に対象を拡大し、新規分だけ差分検出
-    Stage3: 1/2→全件に対象を拡大し、残り全件を差分検出
+    方式C1/C2/C3共通処理：全件精査
+    Stage1: 全体のratio割合をランダム抽出して主題抽出→統合し初期コードブックを作成
+    Stage2: 残り（1-ratio）を差分検出（ratio=1.0の場合は残りがないため実施しない）
     途中のステージまでの結果はセッション内でキャッシュし、後段の失敗時に前段からの
-    やり直しを避ける（同一データ・設問名・分析データの特徴の場合のみ再利用）。
+    やり直しを避ける（同一データ・設問名・分析データの特徴・ratioの場合のみ再利用）。
     """
-    cache_key   = _topics_cache_key(all_items, q_name, data_context)
+    cache_key   = _topics_cache_key(all_items, q_name, data_context) + f':{ratio}'
     stage_cache = st.session_state.setdefault('stage_codebook_cache', {})
     cached      = stage_cache.get(cache_key)
     stage_done  = cached['stage'] if cached else 0
     codebook    = cached['codebook'] if cached else None
 
-    n1 = max(len(all_items) // 5, 1)
-    n2 = max(len(all_items) // 2, n1)
+    n1        = max(int(len(all_items) * ratio), 1)
+    remaining = all_items[n1:]
 
     if stage_done >= 1:
         status_text.markdown('**Step 1/3** Stage1: キャッシュ済みの初期コードブックを再利用...')
-        progress_bar.progress(0.15)
+        progress_bar.progress(0.15 if remaining else 0.30)
     else:
         codebook = _build_codebook_c_stage1(
             client, all_items[:n1], max_codes, q_name, data_context, progress_bar, status_text
@@ -871,24 +912,20 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
         stage_done = 1
         stage_cache[cache_key] = {'stage': 1, 'codebook': codebook}
 
+    if not remaining:
+        progress_bar.progress(0.30)
+        return codebook
+
     if stage_done >= 2:
         status_text.markdown('**Step 1/3** Stage2: キャッシュ済みの結果を再利用...')
-        progress_bar.progress(0.22)
+        progress_bar.progress(0.30)
     else:
-        status_text.markdown(f'**Step 1/3** Stage2: 全体の1/2（{n2}件）まで対象を拡大し差分検出中...')
+        status_text.markdown(f'**Step 1/3** Stage2: 残り{len(remaining)}件を差分検出中...')
         codebook = _diff_detect_loop(
-            client, codebook, all_items[n1:n2], max_codes, q_name, progress_bar, p_start=0.15, p_end=0.22
+            client, codebook, remaining, max_codes, q_name, progress_bar, p_start=0.15, p_end=0.30
         )
-        stage_done = 2
         stage_cache[cache_key] = {'stage': 2, 'codebook': codebook}
 
-    status_text.markdown(f'**Step 1/3** Stage3: 残り全件（{len(all_items)-n2}件）を差分検出中...')
-    codebook = _diff_detect_loop(
-        client, codebook, all_items[n2:], max_codes, q_name, progress_bar, p_start=0.22, p_end=0.30
-    )
-    stage_cache[cache_key] = {'stage': 3, 'codebook': codebook}
-
-    progress_bar.progress(0.30)
     return codebook
 
 
@@ -896,8 +933,9 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
 # メイン処理
 # ══════════════════════════════════════════════════
 
-def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='', codebook_mode='A'):
-    """コードブック策定→全件コーディング→集計を実行"""
+def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
+                  codebook_mode='A', existing_codebook=None):
+    """コードブック策定（または既存コードブックの再利用）→全件コーディング→集計を実行"""
 
     reset_token_usage()
     client = make_client('Anthropic', api_key)
@@ -909,10 +947,15 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     status_text.markdown('**Step 1/3** コードブックを生成中...')
     progress_bar.progress(0.05)
 
-    if codebook_mode == 'B':
+    if codebook_mode == 'EXISTING':
+        status_text.markdown('**Step 1/3** アップロードされたコードブックを使用します')
+        codebook = existing_codebook
+        progress_bar.progress(0.30)
+    elif codebook_mode == 'B':
         codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
-    elif codebook_mode == 'C':
-        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
+    elif codebook_mode in CODEBOOK_MODE_C_RATIO:
+        ratio = CODEBOOK_MODE_C_RATIO[codebook_mode]
+        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
     else:
         codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
 
@@ -951,20 +994,21 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
 
     # ── Step3: 集計 ───────────────────────────────────────────────
     status_text.markdown('**Step 3/3** 集計中...')
-    gt, sent_counts = aggregate_results(codes, results, total)
+    gt, sent_counts, unassigned = aggregate_results(codes, results, total)
     progress_bar.progress(1.0)
     status_text.markdown('**✅ 分析完了！**')
 
     usage = get_token_usage()
     return {
-        'codebook': codebook,
-        'codes':    codes,
-        'results':  results,
-        'gt':       gt,
-        'sent':     sent_counts,
-        'total':    total,
-        'items':    all_items,
-        'usage':    usage,
+        'codebook':    codebook,
+        'codes':       codes,
+        'results':     results,
+        'gt':          gt,
+        'sent':        sent_counts,
+        'unassigned':  unassigned,
+        'total':       total,
+        'items':       all_items,
+        'usage':       usage,
     }
 # ══════════════════════════════════════════════════
 # Streamlit UI
@@ -1014,10 +1058,28 @@ with st.sidebar:
     codebook_mode = CODEBOOK_MODE_CODE[codebook_mode_label]
 
     n_texts = st.session_state.texts_count
-    if n_texts >= 2000 and codebook_mode != 'C':
-        st.info(f'📊 {n_texts}件のデータには方式Cを推奨します')
+    if n_texts >= 2000 and codebook_mode in ('A', 'B'):
+        st.info(f'📊 {n_texts}件のデータには方式C1〜C3を推奨します')
     elif n_texts >= 500 and codebook_mode == 'A':
         st.info(f'📊 {n_texts}件のデータには方式B以上を推奨します')
+
+    existing_codebook_data = None
+    if codebook_mode == 'EXISTING':
+        existing_file = st.file_uploader(
+            'コードブックファイル（JSON）',
+            type=['json'],
+            help='「コーディングルール（JSON）をダウンロード」で保存したファイルを指定してください'
+        )
+        if existing_file:
+            try:
+                existing_codebook_data = json.loads(existing_file.read().decode('utf-8'))
+                n_loaded_codes = sum(
+                    len(cat.get('codes', [])) for cat in existing_codebook_data.get('categories', [])
+                )
+                st.success(f'✅ コードブックを読み込みました（{n_loaded_codes}コード）')
+            except Exception as e:
+                st.error(f'JSONの読み込みに失敗しました: {e}')
+        st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
 
     st.divider()
     st.markdown('**📖 使い方**')
@@ -1114,8 +1176,10 @@ with col2:
 st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
-if st.button('🚀 分析開始', type='primary', use_container_width=True,
-             disabled=not (texts and q_name and api_key)):
+mode_ready = codebook_mode != 'EXISTING' or existing_codebook_data is not None
+
+if st.button('🚀 分析開始', type='primary', width='stretch',
+             disabled=not (texts and q_name and api_key and mode_ready)):
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
@@ -1123,7 +1187,7 @@ if st.button('🚀 分析開始', type='primary', use_container_width=True,
     with st.spinner('分析中...'):
         result = run_analysis(
             api_key, q_name, texts, max_codes,
-            progress_bar, status_text, data_context, codebook_mode
+            progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
         )
 
     if result:
@@ -1171,9 +1235,10 @@ if active_result:
 
         # センチメント集計
         st.markdown('#### 😊 センチメント集計')
-        c1, c2, c3 = st.columns(3)
-        total = result['total']
-        sent  = result['sent']
+        c1, c2, c3, c4 = st.columns(4)
+        total      = result['total']
+        sent       = result['sent']
+        unassigned = result.get('unassigned', 0)
         with c1:
             cnt = sent['positive']
             st.metric('ポジティブ', f'{cnt}件', f'{cnt/total*100:.1f}%')
@@ -1183,6 +1248,8 @@ if active_result:
         with c3:
             cnt = sent['neutral']
             st.metric('ニュートラル', f'{cnt}件', f'{cnt/total*100:.1f}%')
+        with c4:
+            st.metric('非該当（コードなし）', f'{unassigned}件', f'{unassigned/total*100:.1f}%')
 
         st.divider()
 
@@ -1253,12 +1320,24 @@ if active_result:
         st.markdown('#### 💾 レポートのダウンロード')
         excel_bytes = create_excel(
             q_name, gt, sent, total,
-            result['results'], result['items'], result['codes']
+            result['results'], result['items'], result['codes'], unassigned
         )
-        st.download_button(
-            label='📥 Excelレポートをダウンロード',
-            data=excel_bytes,
-            file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            use_container_width=True,
-        )
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                label='📥 Excelレポートをダウンロード',
+                data=excel_bytes,
+                file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                width='stretch',
+            )
+        with dl2:
+            codebook_json = json.dumps(result['codebook'], ensure_ascii=False, indent=2)
+            st.download_button(
+                label='📥 コーディングルール（JSON）をダウンロード',
+                data=codebook_json.encode('utf-8'),
+                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
+                mime='application/json',
+                width='stretch',
+                help='ここでダウンロードしたJSONは、サイドバーの「既存のコードブックを使用（アップロード）」から再利用できます',
+            )
