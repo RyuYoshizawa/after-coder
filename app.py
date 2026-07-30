@@ -5,7 +5,6 @@ Streamlit Webアプリ
 
 import streamlit as st
 import anthropic
-import csv
 import hashlib
 import json
 import re
@@ -467,27 +466,67 @@ def aggregate_results(codes, results, total):
     return gt, sent_counts, unassigned
 
 
-def codebook_to_json_bytes(codebook):
-    """コードブックを再利用可能なJSONバイト列に変換"""
-    return json.dumps(codebook, ensure_ascii=False, indent=2).encode('utf-8')
+CODEBOOK_CSV_COLUMNS = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード']
 
 
-def codebook_to_csv_bytes(codebook):
-    """コードブックをCSVバイト列に変換（Excelでの文字化けを防ぐためUTF-8 BOM付き）"""
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード'])
-    for cat in codebook.get('categories', []):
-        for c in cat.get('codes', []):
-            keywords = c.get('keywords', '')
-            if isinstance(keywords, list):
-                keywords = '; '.join(keywords)
-            writer.writerow([
-                cat.get('cat_id', ''), cat.get('cat_name', ''),
-                c.get('code_id', ''), c.get('code_name', ''),
-                c.get('definition', ''), keywords,
-            ])
-    return ('﻿' + buf.getvalue()).encode('utf-8')
+def render_codebook_table(codebook, expanded=False):
+    """
+    生成・使用したコードブックをカテゴリ→コード形式の表で折りたたみ表示する。
+    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる。
+    """
+    import pandas as pd
+    codes = [
+        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+        for cat in codebook.get('categories', [])
+        for c in cat.get('codes', [])
+    ]
+    n_cats = len(codebook.get('categories', []))
+    with st.expander(f'📐 コードブックを表示（カテゴリ{n_cats}／コード{len(codes)}）', expanded=expanded):
+        df = pd.DataFrame(codes)
+        show_cols = [c for c in ['cat_id', 'cat_name', 'code_id', 'code_name', 'definition', 'keywords'] if c in df.columns]
+        df = df[show_cols].rename(columns={
+            'cat_id': 'カテゴリID', 'cat_name': 'カテゴリ名', 'code_id': 'コードID',
+            'code_name': 'コード名', 'definition': '定義', 'keywords': 'キーワード',
+        })
+        if 'キーワード' in df.columns:
+            df['キーワード'] = df['キーワード'].apply(lambda kw: '; '.join(kw) if isinstance(kw, list) else (kw or ''))
+        st.dataframe(df, width='stretch', hide_index=True)
+
+
+def parse_codebook_csv(file_bytes):
+    """
+    render_codebook_tableの表からダウンロードしたCSV（カテゴリID,カテゴリ名,コードID,コード名,定義,キーワード）を
+    コードブック構造（{'categories': [...]}）に復元する
+    """
+    import pandas as pd
+    for enc in ('utf-8-sig', 'cp932'):
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, dtype=str, keep_default_na=False)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ValueError('文字コードを判定できませんでした（UTF-8またはShift-JISで保存し直してください）')
+
+    missing = [c for c in CODEBOOK_CSV_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f'必要な列が見つかりません: {", ".join(missing)}')
+
+    categories = {}
+    for _, row in df.iterrows():
+        cat_id = row['カテゴリID'].strip()
+        if not cat_id:
+            continue
+        if cat_id not in categories:
+            categories[cat_id] = {'cat_id': cat_id, 'cat_name': row['カテゴリ名'].strip(), 'codes': []}
+        keywords = [k.strip() for k in row['キーワード'].split(';') if k.strip()]
+        categories[cat_id]['codes'].append({
+            'code_id':    row['コードID'].strip(),
+            'code_name':  row['コード名'].strip(),
+            'definition': row['定義'].strip(),
+            'keywords':   keywords,
+        })
+    return {'categories': list(categories.values())}
 
 
 def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassigned=0):
@@ -764,47 +803,15 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
 # ══════════════════════════════════════════════════
 
 CODEBOOK_MODES = [
-    {
-        'code':  'A',
-        'label': '方式A：標準',
-        'desc':  '少量サンプル（30件）でコードブックを生成し差分検出\n\n'
-                 '速度：速い／コスト：低／精度：標準\n\n推奨：〜500件',
-    },
-    {
-        'code':  'B',
-        'label': '方式B：トップダウン＋ボトムアップ（推奨）',
-        'desc':  '「分析データの特徴」欄からコードの骨格を先に生成し、骨格を土台にボトムアップの差分検出を実施\n\n'
-                 '「分析データの特徴」が空の場合は方式Aにフォールバック\n\n'
-                 '速度：標準／コスト：標準／精度：高\n\n推奨：500〜2000件',
-    },
-    {
-        'code':  'C1',
-        'label': '方式C1：全件精査（1/4抽出）',
-        'desc':  '全体の1/4を主題抽出→統合して初期コードブックを作成し、残り3/4を差分検出\n\n'
-                 '速度：やや遅い／コスト：中〜高／精度：高\n\n推奨：2000件〜（C1〜C3で最も軽量）',
-    },
-    {
-        'code':  'C2',
-        'label': '方式C2：全件精査（ハーフ抽出）',
-        'desc':  '全体の1/2を主題抽出→統合して初期コードブックを作成し、残り1/2を差分検出\n\n'
-                 '速度：遅い／コスト：高／精度：高〜最高\n\n推奨：2000件〜',
-    },
-    {
-        'code':  'C3',
-        'label': '方式C3：全件精査（フル抽出）',
-        'desc':  '全件を主題抽出→統合してコードブックを確定（差分検出ステージなし）\n\n'
-                 '速度：最も遅い／コスト：最も高い／精度：最高\n\n推奨：精度を最優先したい場合',
-    },
-    {
-        'code':  'EXISTING',
-        'label': '既存のコードブックを使用（アップロード）',
-        'desc':  '以前ダウンロードしたコードブック（JSON）を指定し、コードブック生成をスキップして直接コーディングします\n\n'
-                 '速度：最速／コスト：最安（コーディングのみ実行）',
-    },
+    {'code': 'A',        'label': '方式A：標準'},
+    {'code': 'B',        'label': '方式B：トップダウン＋ボトムアップ（推奨）'},
+    {'code': 'C1',       'label': '方式C1：全件精査（1/4抽出）'},
+    {'code': 'C2',       'label': '方式C2：全件精査（ハーフ抽出）'},
+    {'code': 'C3',       'label': '方式C3：全件精査（フル抽出）'},
+    {'code': 'EXISTING', 'label': '既存のコードブックを使用（アップロード）'},
 ]
-CODEBOOK_MODE_LABELS = [m['label'] for m in CODEBOOK_MODES]
-CODEBOOK_MODE_DESC   = {m['label']: m['desc'] for m in CODEBOOK_MODES}
-CODEBOOK_MODE_CODE   = {m['label']: m['code'] for m in CODEBOOK_MODES}
+CODEBOOK_MODE_LABELS  = [m['label'] for m in CODEBOOK_MODES]
+CODEBOOK_MODE_CODE    = {m['label']: m['code'] for m in CODEBOOK_MODES}
 CODEBOOK_MODE_C_RATIO = {'C1': 0.25, 'C2': 0.5, 'C3': 1.0}
 
 
@@ -978,6 +985,51 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
     return codebook
 
 
+def _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text):
+    """Step2（全件コーディング）＋Step3（集計）の共通処理。トークン使用量の集計は呼び出し側で行う"""
+    total = len(all_items)
+    codes = [
+        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+        for cat in codebook.get('categories', [])
+        for c in cat.get('codes', [])
+    ]
+    status_text.markdown(f'**Step 1/3** コードブック完成：{len(codes)}コード ✓')
+    progress_bar.progress(0.30)
+
+    # ── Step2: 全件コーディング ───────────────────────────────────
+    status_text.markdown('**Step 2/3** 全件コーディング中...')
+    BATCH   = 15
+    results = []
+    batches = [all_items[i:i+BATCH] for i in range(0, total, BATCH)]
+    for bi, batch in enumerate(batches):
+        res = llm_code_batch(client, batch, codes, q_name)
+        results.extend(res)
+        pct = 0.30 + 0.60 * ((bi+1) / len(batches))
+        progress_bar.progress(min(pct, 0.90))
+        status_text.markdown(f'**Step 2/3** コーディング中... {bi+1}/{len(batches)}バッチ')
+        time.sleep(0.1)
+
+    status_text.markdown(f'**Step 2/3** コーディング完了：{len(results)}件 ✓')
+    progress_bar.progress(0.92)
+
+    # ── Step3: 集計 ───────────────────────────────────────────────
+    status_text.markdown('**Step 3/3** 集計中...')
+    gt, sent_counts, unassigned = aggregate_results(codes, results, total)
+    progress_bar.progress(1.0)
+    status_text.markdown('**✅ 分析完了！**')
+
+    return {
+        'codebook':   codebook,
+        'codes':      codes,
+        'results':    results,
+        'gt':         gt,
+        'sent':       sent_counts,
+        'unassigned': unassigned,
+        'total':      total,
+        'items':      all_items,
+    }
+
+
 def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
                        codebook_mode='A'):
     """コードブック策定のみを実行し、全件コーディング・集計はスキップする（策定方式の試行用）"""
@@ -1011,8 +1063,27 @@ def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_te
         'codebook_only': True,
         'codebook':      codebook,
         'codes':         codes,
+        'items':         all_items,
+        'q_name':        q_name,
         'usage':         usage,
     }
+
+
+def run_coding_from_codebook(api_key, q_name, codebook, all_items, progress_bar, status_text, prior_usage=None):
+    """策定済み（生成済み・アップロード済み問わず）のコードブックを使って全件コーディング→集計のみ実行"""
+    reset_token_usage()
+    client = make_client('Anthropic', api_key)
+
+    result = _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text)
+
+    usage = get_token_usage()
+    if prior_usage:
+        usage = {
+            'input':  usage.get('input', 0)  + prior_usage.get('input', 0),
+            'output': usage.get('output', 0) + prior_usage.get('output', 0),
+        }
+    result['usage'] = usage
+    return result
 
 
 def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
@@ -1023,7 +1094,6 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     client = make_client('Anthropic', api_key)
     all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
     random.shuffle(all_items)
-    total = len(all_items)
 
     # ── Step1: コードブック策定 ──────────────────────────────────
     status_text.markdown('**Step 1/3** コードブックを生成中...')
@@ -1040,49 +1110,9 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
         )
         return None
 
-    # コードをフラットリストに
-    codes = [
-        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-        for cat in codebook.get('categories', [])
-        for c in cat.get('codes', [])
-    ]
-    status_text.markdown(f'**Step 1/3** コードブック完成：{len(codes)}コード ✓')
-    progress_bar.progress(0.30)
-
-    # ── Step2: 全件コーディング ───────────────────────────────────
-    status_text.markdown('**Step 2/3** 全件コーディング中...')
-    BATCH   = 15
-    results = []
-    batches = [all_items[i:i+BATCH] for i in range(0, total, BATCH)]
-    for bi, batch in enumerate(batches):
-        res = llm_code_batch(client, batch, codes, q_name)
-        results.extend(res)
-        pct = 0.30 + 0.60 * ((bi+1) / len(batches))
-        progress_bar.progress(min(pct, 0.90))
-        status_text.markdown(f'**Step 2/3** コーディング中... {bi+1}/{len(batches)}バッチ')
-        time.sleep(0.1)
-
-    status_text.markdown(f'**Step 2/3** コーディング完了：{len(results)}件 ✓')
-    progress_bar.progress(0.92)
-
-    # ── Step3: 集計 ───────────────────────────────────────────────
-    status_text.markdown('**Step 3/3** 集計中...')
-    gt, sent_counts, unassigned = aggregate_results(codes, results, total)
-    progress_bar.progress(1.0)
-    status_text.markdown('**✅ 分析完了！**')
-
-    usage = get_token_usage()
-    return {
-        'codebook':    codebook,
-        'codes':       codes,
-        'results':     results,
-        'gt':          gt,
-        'sent':        sent_counts,
-        'unassigned':  unassigned,
-        'total':       total,
-        'items':       all_items,
-        'usage':       usage,
-    }
+    result = _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text)
+    result['usage'] = get_token_usage()
+    return result
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
@@ -1127,7 +1157,6 @@ with st.sidebar:
         index=1,
         label_visibility='collapsed',
     )
-    st.caption(CODEBOOK_MODE_DESC[codebook_mode_label])
     codebook_mode = CODEBOOK_MODE_CODE[codebook_mode_label]
 
     n_texts = st.session_state.texts_count
@@ -1137,29 +1166,34 @@ with st.sidebar:
         st.info(f'📊 {n_texts}件のデータには方式B以上を推奨します')
 
     existing_codebook_data = None
-    codebook_only = False
     if codebook_mode == 'EXISTING':
+        run_full_pipeline = True  # 既存のコードブックを使う場合は常にコーディングまで実行
         existing_file = st.file_uploader(
-            'コードブックファイル（JSON）',
-            type=['json'],
-            help='「コーディングルール（JSON）をダウンロード」で保存したファイルを指定してください'
+            'コードブックファイル（CSV または JSON）',
+            type=['csv', 'json'],
+            help='「コードブックを表示」の表右上のツールバーからダウンロードしたCSV、'
+                 'または以前保存したJSONファイルを指定してください'
         )
         if existing_file:
             try:
-                existing_codebook_data = json.loads(existing_file.read().decode('utf-8'))
+                if existing_file.name.lower().endswith('.csv'):
+                    existing_codebook_data = parse_codebook_csv(existing_file.read())
+                else:
+                    existing_codebook_data = json.loads(existing_file.read().decode('utf-8'))
                 n_loaded_codes = sum(
                     len(cat.get('codes', [])) for cat in existing_codebook_data.get('categories', [])
                 )
                 st.success(f'✅ コードブックを読み込みました（{n_loaded_codes}コード）')
             except Exception as e:
-                st.error(f'JSONの読み込みに失敗しました: {e}')
+                st.error(f'ファイルの読み込みに失敗しました: {e}')
         st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
     else:
-        codebook_only = st.checkbox(
-            'コードブック策定のみ実行（コーディングはスキップ）',
-            help='チェックすると、コードブックの生成だけを行い、全件コーディング・集計はスキップします。'
-                 '策定方式（A/B/C1〜C3）を安く試行し、気に入ったコードブックをJSON/CSVでダウンロードしてから、'
-                 '「既存のコードブックを使用」で改めてコーディングする使い方を想定しています。'
+        run_full_pipeline = st.checkbox(
+            'コーディングまで全て実行する',
+            value=False,
+            help='デフォルトではコードブック策定のみを行い、内容を確認してから'
+                 '「▶ コーディングを実行する」で続行できます。'
+                 'チェックすると、策定から全件コーディング・集計まで一気に実行します。'
         )
 
     st.divider()
@@ -1258,7 +1292,7 @@ st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
 mode_ready   = codebook_mode != 'EXISTING' or existing_codebook_data is not None
-button_label = '📐 コードブック生成開始' if codebook_only else '🚀 分析開始'
+button_label = '🚀 分析開始' if run_full_pipeline else '📐 コードブック生成開始'
 
 if st.button(button_label, type='primary', width='stretch',
              disabled=not (texts and q_name and api_key and mode_ready)):
@@ -1267,7 +1301,7 @@ if st.button(button_label, type='primary', width='stretch',
     status_text  = st.empty()
 
     with st.spinner('処理中...'):
-        if codebook_only:
+        if not run_full_pipeline:
             result = run_codebook_only(
                 api_key, q_name, texts, max_codes,
                 progress_bar, status_text, data_context, codebook_mode
@@ -1318,40 +1352,23 @@ if active_result:
 
         st.divider()
 
-        import pandas as pd
-        codebook_result = result['codebook']
-        codes = result['codes']
-        st.subheader('📐 生成されたコードブック')
-        st.caption(f'カテゴリ数：{len(codebook_result.get("categories", []))}／コード数：{len(codes)}')
-
-        df_codebook = pd.DataFrame(codes)
-        show_cols = [c for c in ['cat_id', 'cat_name', 'code_id', 'code_name', 'definition', 'keywords'] if c in df_codebook.columns]
-        df_codebook = df_codebook[show_cols].rename(columns={
-            'cat_id': 'カテゴリID', 'cat_name': 'カテゴリ名', 'code_id': 'コードID',
-            'code_name': 'コード名', 'definition': '定義', 'keywords': 'キーワード',
-        })
-        st.dataframe(df_codebook, width='stretch', hide_index=True)
+        render_codebook_table(result['codebook'], expanded=True)
 
         st.divider()
-        st.markdown('#### 💾 コードブックのダウンロード')
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                label='📥 コードブック（JSON）をダウンロード',
-                data=codebook_to_json_bytes(codebook_result),
-                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
-                mime='application/json',
-                width='stretch',
-                help='サイドバーの「既存のコードブックを使用（アップロード）」から再利用できます',
-            )
-        with dl2:
-            st.download_button(
-                label='📥 コードブック（CSV）をダウンロード',
-                data=codebook_to_csv_bytes(codebook_result),
-                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
-                mime='text/csv',
-                width='stretch',
-            )
+        if st.button('▶ コーディングを実行する', type='primary', width='stretch'):
+            progress_bar2 = st.progress(0)
+            status_text2  = st.empty()
+            with st.spinner('コーディング中...'):
+                continued = run_coding_from_codebook(
+                    api_key, result.get('q_name', q_name), result['codebook'], result['items'],
+                    progress_bar2, status_text2, prior_usage=result.get('usage')
+                )
+            if continued:
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = continued
+                        break
+                st.rerun()
 
     else:
         st.success('✅ 分析が完了しました！')
@@ -1367,6 +1384,8 @@ if active_result:
             c2.metric('出力トークン', f'{out:,}')
             c3.metric('推定コスト', f'約 ¥{cost:.0f}')
             st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
+
+        render_codebook_table(result['codebook'])
 
         st.divider()
 
@@ -1462,29 +1481,10 @@ if active_result:
             q_name, gt, sent, total,
             result['results'], result['items'], result['codes'], unassigned
         )
-        dl1, dl2, dl3 = st.columns(3)
-        with dl1:
-            st.download_button(
-                label='📥 Excelレポートをダウンロード',
-                data=excel_bytes,
-                file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                width='stretch',
-            )
-        with dl2:
-            st.download_button(
-                label='📥 コーディングルール（JSON）をダウンロード',
-                data=codebook_to_json_bytes(result['codebook']),
-                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
-                mime='application/json',
-                width='stretch',
-                help='ここでダウンロードしたJSONは、サイドバーの「既存のコードブックを使用（アップロード）」から再利用できます',
-            )
-        with dl3:
-            st.download_button(
-                label='📥 コーディングルール（CSV）をダウンロード',
-                data=codebook_to_csv_bytes(result['codebook']),
-                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
-                mime='text/csv',
-                width='stretch',
-            )
+        st.download_button(
+            label='📥 Excelレポートをダウンロード',
+            data=excel_bytes,
+            file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            width='stretch',
+        )
