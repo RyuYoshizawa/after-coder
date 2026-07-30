@@ -5,6 +5,7 @@ Streamlit Webアプリ
 
 import streamlit as st
 import anthropic
+import csv
 import hashlib
 import json
 import re
@@ -464,6 +465,29 @@ def aggregate_results(codes, results, total):
         })
     gt.sort(key=lambda x: x['count'], reverse=True)
     return gt, sent_counts, unassigned
+
+
+def codebook_to_json_bytes(codebook):
+    """コードブックを再利用可能なJSONバイト列に変換"""
+    return json.dumps(codebook, ensure_ascii=False, indent=2).encode('utf-8')
+
+
+def codebook_to_csv_bytes(codebook):
+    """コードブックをCSVバイト列に変換（Excelでの文字化けを防ぐためUTF-8 BOM付き）"""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード'])
+    for cat in codebook.get('categories', []):
+        for c in cat.get('codes', []):
+            keywords = c.get('keywords', '')
+            if isinstance(keywords, list):
+                keywords = '; '.join(keywords)
+            writer.writerow([
+                cat.get('cat_id', ''), cat.get('cat_name', ''),
+                c.get('code_id', ''), c.get('code_name', ''),
+                c.get('definition', ''), keywords,
+            ])
+    return ('﻿' + buf.getvalue()).encode('utf-8')
 
 
 def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassigned=0):
@@ -933,6 +957,64 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
 # メイン処理
 # ══════════════════════════════════════════════════
 
+def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+                             codebook_mode, existing_codebook=None):
+    """Step1相当：指定方式でコードブックを生成（または既存コードブックを使用）して返す"""
+    status_text.markdown('**コードブックを生成中...**')
+    progress_bar.progress(0.05)
+
+    if codebook_mode == 'EXISTING':
+        status_text.markdown('**アップロードされたコードブックを使用します**')
+        codebook = existing_codebook
+        progress_bar.progress(0.30)
+    elif codebook_mode == 'B':
+        codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
+    elif codebook_mode in CODEBOOK_MODE_C_RATIO:
+        ratio = CODEBOOK_MODE_C_RATIO[codebook_mode]
+        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
+    else:
+        codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
+
+    return codebook
+
+
+def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
+                       codebook_mode='A'):
+    """コードブック策定のみを実行し、全件コーディング・集計はスキップする（策定方式の試行用）"""
+
+    reset_token_usage()
+    client = make_client('Anthropic', api_key)
+    all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
+    random.shuffle(all_items)
+
+    codebook = _generate_codebook_step(
+        client, all_items, max_codes, q_name, data_context, progress_bar, status_text, codebook_mode
+    )
+    if not codebook:
+        reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+        st.error(
+            'コードブック生成に失敗しました。再度お試しください。'
+            + f'\n\n詳細: {reason}'
+        )
+        return None
+
+    codes = [
+        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+        for cat in codebook.get('categories', [])
+        for c in cat.get('codes', [])
+    ]
+    progress_bar.progress(1.0)
+    status_text.markdown('**✅ コードブック生成完了！**')
+
+    usage = get_token_usage()
+    return {
+        'codebook_only': True,
+        'codebook':      codebook,
+        'codes':         codes,
+        'usage':         usage,
+    }
+
+
 def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
                   codebook_mode='A', existing_codebook=None):
     """コードブック策定（または既存コードブックの再利用）→全件コーディング→集計を実行"""
@@ -945,19 +1027,10 @@ def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, d
 
     # ── Step1: コードブック策定 ──────────────────────────────────
     status_text.markdown('**Step 1/3** コードブックを生成中...')
-    progress_bar.progress(0.05)
-
-    if codebook_mode == 'EXISTING':
-        status_text.markdown('**Step 1/3** アップロードされたコードブックを使用します')
-        codebook = existing_codebook
-        progress_bar.progress(0.30)
-    elif codebook_mode == 'B':
-        codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
-    elif codebook_mode in CODEBOOK_MODE_C_RATIO:
-        ratio = CODEBOOK_MODE_C_RATIO[codebook_mode]
-        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
-    else:
-        codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
+    codebook = _generate_codebook_step(
+        client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+        codebook_mode, existing_codebook
+    )
 
     if not codebook:
         reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
@@ -1064,6 +1137,7 @@ with st.sidebar:
         st.info(f'📊 {n_texts}件のデータには方式B以上を推奨します')
 
     existing_codebook_data = None
+    codebook_only = False
     if codebook_mode == 'EXISTING':
         existing_file = st.file_uploader(
             'コードブックファイル（JSON）',
@@ -1080,6 +1154,13 @@ with st.sidebar:
             except Exception as e:
                 st.error(f'JSONの読み込みに失敗しました: {e}')
         st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
+    else:
+        codebook_only = st.checkbox(
+            'コードブック策定のみ実行（コーディングはスキップ）',
+            help='チェックすると、コードブックの生成だけを行い、全件コーディング・集計はスキップします。'
+                 '策定方式（A/B/C1〜C3）を安く試行し、気に入ったコードブックをJSON/CSVでダウンロードしてから、'
+                 '「既存のコードブックを使用」で改めてコーディングする使い方を想定しています。'
+        )
 
     st.divider()
     st.markdown('**📖 使い方**')
@@ -1176,19 +1257,26 @@ with col2:
 st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
-mode_ready = codebook_mode != 'EXISTING' or existing_codebook_data is not None
+mode_ready   = codebook_mode != 'EXISTING' or existing_codebook_data is not None
+button_label = '📐 コードブック生成開始' if codebook_only else '🚀 分析開始'
 
-if st.button('🚀 分析開始', type='primary', width='stretch',
+if st.button(button_label, type='primary', width='stretch',
              disabled=not (texts and q_name and api_key and mode_ready)):
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
 
-    with st.spinner('分析中...'):
-        result = run_analysis(
-            api_key, q_name, texts, max_codes,
-            progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
-        )
+    with st.spinner('処理中...'):
+        if codebook_only:
+            result = run_codebook_only(
+                api_key, q_name, texts, max_codes,
+                progress_bar, status_text, data_context, codebook_mode
+            )
+        else:
+            result = run_analysis(
+                api_key, q_name, texts, max_codes,
+                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
+            )
 
     if result:
         st.session_state.history_counter += 1
@@ -1213,7 +1301,59 @@ for h in st.session_state.history:
 if active_result:
     result = active_result
     q_name = active_q_name
-    if True:
+
+    if result.get('codebook_only'):
+        st.success('✅ コードブックの生成が完了しました！')
+
+        usage = result.get('usage', {})
+        inp   = usage.get('input', 0)
+        out   = usage.get('output', 0)
+        cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
+        with st.expander('💰 API使用コスト（参考）'):
+            c1, c2, c3 = st.columns(3)
+            c1.metric('入力トークン', f'{inp:,}')
+            c2.metric('出力トークン', f'{out:,}')
+            c3.metric('推定コスト', f'約 ¥{cost:.0f}')
+            st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
+
+        st.divider()
+
+        import pandas as pd
+        codebook_result = result['codebook']
+        codes = result['codes']
+        st.subheader('📐 生成されたコードブック')
+        st.caption(f'カテゴリ数：{len(codebook_result.get("categories", []))}／コード数：{len(codes)}')
+
+        df_codebook = pd.DataFrame(codes)
+        show_cols = [c for c in ['cat_id', 'cat_name', 'code_id', 'code_name', 'definition', 'keywords'] if c in df_codebook.columns]
+        df_codebook = df_codebook[show_cols].rename(columns={
+            'cat_id': 'カテゴリID', 'cat_name': 'カテゴリ名', 'code_id': 'コードID',
+            'code_name': 'コード名', 'definition': '定義', 'keywords': 'キーワード',
+        })
+        st.dataframe(df_codebook, width='stretch', hide_index=True)
+
+        st.divider()
+        st.markdown('#### 💾 コードブックのダウンロード')
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                label='📥 コードブック（JSON）をダウンロード',
+                data=codebook_to_json_bytes(codebook_result),
+                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
+                mime='application/json',
+                width='stretch',
+                help='サイドバーの「既存のコードブックを使用（アップロード）」から再利用できます',
+            )
+        with dl2:
+            st.download_button(
+                label='📥 コードブック（CSV）をダウンロード',
+                data=codebook_to_csv_bytes(codebook_result),
+                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
+                mime='text/csv',
+                width='stretch',
+            )
+
+    else:
         st.success('✅ 分析が完了しました！')
 
         # コスト表示
@@ -1322,7 +1462,7 @@ if active_result:
             q_name, gt, sent, total,
             result['results'], result['items'], result['codes'], unassigned
         )
-        dl1, dl2 = st.columns(2)
+        dl1, dl2, dl3 = st.columns(3)
         with dl1:
             st.download_button(
                 label='📥 Excelレポートをダウンロード',
@@ -1332,12 +1472,19 @@ if active_result:
                 width='stretch',
             )
         with dl2:
-            codebook_json = json.dumps(result['codebook'], ensure_ascii=False, indent=2)
             st.download_button(
                 label='📥 コーディングルール（JSON）をダウンロード',
-                data=codebook_json.encode('utf-8'),
+                data=codebook_to_json_bytes(result['codebook']),
                 file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
                 mime='application/json',
                 width='stretch',
                 help='ここでダウンロードしたJSONは、サイドバーの「既存のコードブックを使用（アップロード）」から再利用できます',
+            )
+        with dl3:
+            st.download_button(
+                label='📥 コーディングルール（CSV）をダウンロード',
+                data=codebook_to_csv_bytes(result['codebook']),
+                file_name=f'CodingRules_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
+                mime='text/csv',
+                width='stretch',
             )
