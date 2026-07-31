@@ -102,7 +102,7 @@ def llm_generate_codebook(client, items, max_codes, q_name, data_context=''):
 - 中間カテゴリ7個前後（最大10個）
 - カテゴリ内コード最大10個、総数{max_codes}個以内
 - 1コード＝1主題
-- コードID形式: CAT01.../C0101...
+- コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）
 
 【回答リスト】
 {text}"""
@@ -197,7 +197,7 @@ def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, da
 - 想定コードに定義を付与する（サンプルに現れない想定コードも残してよい）
 - サンプルに現れる主題で骨格にないものは追加する（総数{max_codes}個以内）
 - 1コード＝1主題
-- コードID形式: CAT01.../C0101..."""
+- コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）"""
 
     schema = {
         'type': 'object',
@@ -300,7 +300,7 @@ def llm_consolidate_topics(client, topics, max_codes, q_name, data_context=''):
 - カテゴリ内コード最大10個、総数{max_codes}個以内
 - 1コード＝1主題
 - 各コードに定義と、判定に役立つキーワードを2〜5個付与する
-- コードID形式: CAT01.../C0101..."""
+- コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）"""
 
     schema = {
         'type': 'object',
@@ -359,7 +359,8 @@ def llm_detect_new_codes(client, items, codebook, max_codes, q_name):
 {text}
 
 新主題がある場合のみ返してください。なければnew_codesを空配列に。
-cat_idは必ず既存カテゴリ一覧のCAT01形式を使うこと。"""
+cat_idは必ず既存カテゴリ一覧のCAT01形式を使うこと。
+code_idは既存コードと同じC0101形式で採番すること（接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）。"""
 
     schema = {
         'type': 'object',
@@ -447,7 +448,7 @@ def llm_edit_codebook(client, codebook, instruction, q_name):
 - 指示された編集（統合・改名・再定義・コードの追加・削除など）のみを行う
 - 指示にない部分はそのまま維持する
 - 生データは参照できないため、指示にない新規コードの発見は行わない
-- コードID・カテゴリIDの形式は維持する（新規追加時はCAT.../C....形式で採番する）
+- コードID・カテゴリIDの形式は維持する（新規追加時はCAT.../C0101形式で採番する。コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）
 - 編集後のコードブック全体を返す"""
 
     schema = {
@@ -547,30 +548,34 @@ def _codebook_rows(codebook, gt_by_code=None, include_stats=False):
     return rows
 
 
-def render_codebook_structure(codebook):
+def render_codebook_structure(codebook, key=None):
     """
     コードブックの構造（カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード）のみを、
     折りたたまず常時表示する。編集直後もその場で最新の内容が確認できる。
+    セルをダブルクリックするとテキストを全文選択・コピーできる（st.data_editorを表示専用に使用。
+    ここでの編集内容は保存されない＝実際のコードブックには反映されない）。
     表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる。
     """
     import pandas as pd
     rows = _codebook_rows(codebook)
     n_cats = len(codebook.get('categories', []))
-    st.caption(f'カテゴリ{n_cats}／コード{len(rows)}')
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.caption(f'カテゴリ{n_cats}／コード{len(rows)}　※セルをダブルクリックするとテキストをコピーできます（ここでの編集内容は保存されません）')
+    st.data_editor(pd.DataFrame(rows), width='stretch', hide_index=True, key=key)
 
 
-def render_code_list_table(codebook, gt_by_code=None, expanded=False):
+def render_code_list_table(codebook, gt_by_code=None, expanded=False, key=None):
     """
     コーディング結果に基づく「コード一覧集計」を折りたたみ表示する。
     列順は 件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード。
     gt_by_codeを渡さない、または未コーディングのコードは件数・出現率とも0として表示する。
+    セルをダブルクリックするとテキストを全文選択・コピーできる（render_codebook_structureと同様）。
     """
     import pandas as pd
     rows = _codebook_rows(codebook, gt_by_code, include_stats=True)
     n_cats = len(codebook.get('categories', []))
     with st.expander(f'📋 コード一覧集計（カテゴリ{n_cats}／コード{len(rows)}）', expanded=expanded):
-        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        st.caption('※セルをダブルクリックするとテキストをコピーできます（ここでの編集内容は保存されません）')
+        st.data_editor(pd.DataFrame(rows), width='stretch', hide_index=True, key=key)
 
 
 def parse_codebook_csv(file_bytes):
@@ -1427,7 +1432,7 @@ if active_result:
 
     # ── コードブック（構造のみ。折りたたまず常時表示、編集直後もその場で最新反映） ──
     st.markdown('#### 📐 コードブック')
-    render_codebook_structure(result['codebook'])
+    render_codebook_structure(result['codebook'], key='codebook_current')
 
     # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
     st.caption(
@@ -1461,7 +1466,7 @@ if active_result:
     pending_edit = result.get('pending_edit')
     if pending_edit:
         st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
-        render_codebook_structure(pending_edit['codebook'])
+        render_codebook_structure(pending_edit['codebook'], key='codebook_pending')
         pc1, pc2 = st.columns(2)
         with pc1:
             if st.button('✅ この内容で確定する', type='primary', width='stretch'):
@@ -1515,11 +1520,11 @@ if active_result:
 
     st.divider()
 
-    # ── 現在のコードブックでコーディングする（1ボタン） ──────────────
-    if coded_count < total_items:
-        if pending_edit:
-            st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
-        else:
+    # ── 現在のコードブックでコーディングする（1ボタン＋全件やり直しボタン） ──
+    if pending_edit:
+        st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
+    else:
+        if coded_count < total_items:
             remaining = total_items - coded_count
             if st.button(f'▶ 現在のコードブックでコーディングする（残り{remaining}件）', type='primary', width='stretch'):
                 progress_bar2 = st.progress(0)
@@ -1536,33 +1541,66 @@ if active_result:
                         h['result'] = result
                         break
                 st.rerun()
-        st.divider()
+        if coded_count > 0:
+            if st.button(f'🔁 現在のコードブックで全件コーディングし直す（全{total_items}件）', width='stretch'):
+                progress_bar3 = st.progress(0)
+                status_text3  = st.empty()
+                with st.spinner('コーディング中...'):
+                    recoded = continue_coding(
+                        api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                        0, total_items, progress_bar3, status_text3,
+                        prior_results=None, prior_usage=result.get('usage'),
+                    )
+                result.update(recoded)
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+            st.caption('※ コードの統合・削除などの編集をコーディング済みの回答すべてに反映したい場合は、こちらで最初からやり直してください。')
+    st.divider()
 
     # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
     if coded_count > 0:
         st.subheader('📊 コーディング結果')
 
         st.markdown('#### 😊 センチメント集計')
-        c1, c2, c3, c4 = st.columns(4)
         sent       = result['sent']
         unassigned = result.get('unassigned', 0)
-        with c1:
-            cnt = sent['positive']
-            st.metric('ポジティブ', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
-        with c2:
-            cnt = sent['negative']
-            st.metric('ネガティブ', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
-        with c3:
-            cnt = sent['neutral']
-            st.metric('ニュートラル', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
-        with c4:
-            st.metric('非該当（コードなし）', f'{unassigned}件', f'{unassigned/coded_count*100:.1f}%')
+        def _pct(cnt):
+            return f'{cnt/coded_count*100:.1f}%' if coded_count else '0.0%'
+        st.markdown(f"""
+<div style="display:flex; flex-wrap:nowrap; overflow-x:auto; gap:32px; padding:4px 0;">
+  <div>😊 <b>ポジティブ</b>　{sent['positive']}件（{_pct(sent['positive'])}）</div>
+  <div>😞 <b>ネガティブ</b>　{sent['negative']}件（{_pct(sent['negative'])}）</div>
+  <div>😐 <b>ニュートラル</b>　{sent['neutral']}件（{_pct(sent['neutral'])}）</div>
+  <div>➖ <b>非該当（コードなし）</b>　{unassigned}件（{_pct(unassigned)}）</div>
+</div>
+""", unsafe_allow_html=True)
+
+        st.divider()
+
+        gt = result['gt']
+        import pandas as pd
+
+        with st.expander('カテゴリ別集計を表示'):
+            cat_summary = {}
+            for item in gt:
+                cid = item['cat_id']
+                if cid not in cat_summary:
+                    cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
+                cat_summary[cid]['件数'] += item['count']
+            df_cat = pd.DataFrame(list(cat_summary.values()))
+            df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
+            df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
+            st.dataframe(df_cat, width='stretch', hide_index=True)
+
+        gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in gt}
+        render_code_list_table(result['codebook'], gt_by_code=gt_by_code, key='code_list_table')
 
         st.divider()
 
         st.markdown('#### 📈 コード別GT集計')
-        gt = result['gt']
-        import pandas as pd
 
         sort_mode = st.radio(
             '表示順',
@@ -1597,21 +1635,6 @@ if active_result:
             margin=dict(b=120),
         )
         st.plotly_chart(fig, width='stretch')
-
-        with st.expander('カテゴリ別集計を表示'):
-            cat_summary = {}
-            for item in gt_sorted:
-                cid = item['cat_id']
-                if cid not in cat_summary:
-                    cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
-                cat_summary[cid]['件数'] += item['count']
-            df_cat = pd.DataFrame(list(cat_summary.values()))
-            df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
-            df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
-            st.dataframe(df_cat, width='stretch', hide_index=True)
-
-        gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in gt}
-        render_code_list_table(result['codebook'], gt_by_code=gt_by_code)
 
         st.divider()
 
