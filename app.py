@@ -427,6 +427,60 @@ def llm_code_batch(client, items, codes, q_name):
     if result and isinstance(result, dict):
         return result.get('results', [])
     return []
+
+
+def llm_edit_codebook(client, codebook, instruction, q_name):
+    """
+    コードブック編集機能：チャット指示に基づき、統合・改名・再定義・追加・削除などの編集を行う。
+    生データは参照しない（新規コードの発見は行わず、既存コードブックの整理のみ）。
+    """
+    codebook_text = json.dumps(codebook, ensure_ascii=False)
+    prompt = f"""「{q_name}」のコードブックを、次の指示に従って編集してください。
+
+【現在のコードブック】
+{codebook_text}
+
+【編集指示】
+{instruction}
+
+【ルール】
+- 指示された編集（統合・改名・再定義・コードの追加・削除など）のみを行う
+- 指示にない部分はそのまま維持する
+- 生データは参照できないため、指示にない新規コードの発見は行わない
+- コードID・カテゴリIDの形式は維持する（新規追加時はCAT.../C....形式で採番する）
+- 編集後のコードブック全体を返す"""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'categories': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'cat_id':   {'type': 'string'},
+                        'cat_name': {'type': 'string'},
+                        'codes': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'code_id':    {'type': 'string'},
+                                    'code_name':  {'type': 'string'},
+                                    'definition': {'type': 'string'},
+                                    'keywords':   {'type': 'array', 'items': {'type': 'string'}},
+                                },
+                                'required': ['code_id', 'code_name', 'definition'],
+                            }
+                        }
+                    },
+                    'required': ['cat_id', 'cat_name', 'codes'],
+                }
+            }
+        },
+        'required': ['categories'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
 # ══════════════════════════════════════════════════
 # 集計・Excel出力関数
 # ══════════════════════════════════════════════════
@@ -1031,8 +1085,8 @@ def _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, statu
 
 
 def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
-                       codebook_mode='A'):
-    """コードブック策定のみを実行し、全件コーディング・集計はスキップする（策定方式の試行用）"""
+                       codebook_mode='A', existing_codebook=None):
+    """コードブック策定のみを実行し、全件コーディング・集計はスキップする（策定方式の試行／既存コードブックの編集用）"""
 
     reset_token_usage()
     client = make_client('Anthropic', api_key)
@@ -1040,7 +1094,8 @@ def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_te
     random.shuffle(all_items)
 
     codebook = _generate_codebook_step(
-        client, all_items, max_codes, q_name, data_context, progress_bar, status_text, codebook_mode
+        client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+        codebook_mode, existing_codebook
     )
     if not codebook:
         reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
@@ -1167,12 +1222,11 @@ with st.sidebar:
 
     existing_codebook_data = None
     if codebook_mode == 'EXISTING':
-        run_full_pipeline = True  # 既存のコードブックを使う場合は常にコーディングまで実行
         existing_file = st.file_uploader(
-            'コードブックファイル（CSV または JSON）',
+            'コードブックファイル（CSV または JSON、過去バージョンも可）',
             type=['csv', 'json'],
             help='「コードブックを表示」の表右上のツールバーからダウンロードしたCSV、'
-                 'または以前保存したJSONファイルを指定してください'
+                 'または以前保存したJSONファイルを指定してください（過去のバージョンをアップロードして編集することもできます）'
         )
         if existing_file:
             try:
@@ -1187,14 +1241,14 @@ with st.sidebar:
             except Exception as e:
                 st.error(f'ファイルの読み込みに失敗しました: {e}')
         st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
-    else:
-        run_full_pipeline = st.checkbox(
-            'コーディングまで全て実行する',
-            value=False,
-            help='デフォルトではコードブック策定のみを行い、内容を確認してから'
-                 '「▶ コーディングを実行する」で続行できます。'
-                 'チェックすると、策定から全件コーディング・集計まで一気に実行します。'
-        )
+
+    run_full_pipeline = st.checkbox(
+        'コーディングまで全て実行する',
+        value=False,
+        help='デフォルトではコードブック策定（または既存コードブックの読み込み）のみを行い、'
+             '内容を確認・編集してから「▶ コーディングを実行する」で続行できます。'
+             'チェックすると、策定から全件コーディング・集計まで一気に実行します。'
+    )
 
     st.divider()
     st.markdown('**📖 使い方**')
@@ -1304,7 +1358,7 @@ if st.button(button_label, type='primary', width='stretch',
         if not run_full_pipeline:
             result = run_codebook_only(
                 api_key, q_name, texts, max_codes,
-                progress_bar, status_text, data_context, codebook_mode
+                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
             )
         else:
             result = run_analysis(
@@ -1353,6 +1407,68 @@ if active_result:
         st.divider()
 
         render_codebook_table(result['codebook'], expanded=True)
+
+        st.divider()
+        st.markdown('#### 💬 コードブックを編集')
+        st.caption(
+            '⚠️ 編集すると現在の内容が置き換わります。保存しておきたい場合は、'
+            '上の表の右上ツールバーから先にCSVをダウンロードしてください。'
+        )
+
+        edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
+
+        if len(edit_log) > 1:
+            with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
+                for i, entry in enumerate(edit_log):
+                    n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
+                    hc1, hc2 = st.columns([4, 1])
+                    hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
+                    if i != len(edit_log) - 1:
+                        if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
+                            edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
+                            result['codebook'] = entry['codebook']
+                            result['codes'] = [
+                                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                                for cat in entry['codebook'].get('categories', [])
+                                for c in cat.get('codes', [])
+                            ]
+                            for h in st.session_state.history:
+                                if h['id'] == st.session_state.active_history_id:
+                                    h['result'] = result
+                                    break
+                            st.rerun()
+
+        for entry in edit_log[1:]:
+            with st.chat_message('user'):
+                st.write(entry['instruction'])
+            with st.chat_message('assistant'):
+                n_cats  = len(entry['codebook'].get('categories', []))
+                n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
+                st.write(f'更新しました（カテゴリ{n_cats}／コード{n_codes}）')
+
+        instruction = st.chat_input(
+            '編集の指示を入力（例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜）'
+        )
+        if instruction:
+            with st.spinner('編集中...'):
+                client  = make_client('Anthropic', api_key)
+                updated = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
+            if updated:
+                edit_log.append({'instruction': instruction, 'codebook': updated})
+                result['codebook'] = updated
+                result['codes'] = [
+                    {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                    for cat in updated.get('categories', [])
+                    for c in cat.get('codes', [])
+                ]
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+            else:
+                reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+                st.error(f'編集に失敗しました。再度お試しください。\n\n詳細: {reason}')
 
         st.divider()
         if st.button('▶ コーディングを実行する', type='primary', width='stretch'):
