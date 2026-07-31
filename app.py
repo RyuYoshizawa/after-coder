@@ -523,27 +523,37 @@ def aggregate_results(codes, results, total):
 CODEBOOK_CSV_COLUMNS = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード']
 
 
-def render_codebook_table(codebook, expanded=False):
+def render_codebook_table(codebook, gt_by_code=None, expanded=False):
     """
-    生成・使用したコードブックをカテゴリ→コード形式の表で折りたたみ表示する。
-    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる。
+    コードブックを「全コード一覧」として折りたたみ表示する（旧・コードブック表示と全コード一覧を統合）。
+    列順は 件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード。
+    gt_by_code（code_id -> {'count':int,'pct':float}）を渡すとその値を、渡さない／未コーディングの
+    コードは件数・出現率とも0として表示する。
+    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる
+    （件数・出現率列は再読み込み時に無視される）。
     """
     import pandas as pd
-    codes = [
-        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-        for cat in codebook.get('categories', [])
-        for c in cat.get('codes', [])
-    ]
+    gt_by_code = gt_by_code or {}
+    rows = []
+    for cat in codebook.get('categories', []):
+        for c in cat.get('codes', []):
+            stat = gt_by_code.get(c.get('code_id'), {})
+            keywords = c.get('keywords', [])
+            if isinstance(keywords, list):
+                keywords = '; '.join(keywords)
+            rows.append({
+                '件数':       stat.get('count', 0),
+                '出現率(%)':  stat.get('pct', 0.0),
+                'カテゴリID': cat.get('cat_id', ''),
+                'カテゴリ名': cat.get('cat_name', ''),
+                'コードID':   c.get('code_id', ''),
+                'コード名':   c.get('code_name', ''),
+                '定義':       c.get('definition', ''),
+                'キーワード': keywords or '',
+            })
     n_cats = len(codebook.get('categories', []))
-    with st.expander(f'📐 コードブックを表示（カテゴリ{n_cats}／コード{len(codes)}）', expanded=expanded):
-        df = pd.DataFrame(codes)
-        show_cols = [c for c in ['cat_id', 'cat_name', 'code_id', 'code_name', 'definition', 'keywords'] if c in df.columns]
-        df = df[show_cols].rename(columns={
-            'cat_id': 'カテゴリID', 'cat_name': 'カテゴリ名', 'code_id': 'コードID',
-            'code_name': 'コード名', 'definition': '定義', 'keywords': 'キーワード',
-        })
-        if 'キーワード' in df.columns:
-            df['キーワード'] = df['キーワード'].apply(lambda kw: '; '.join(kw) if isinstance(kw, list) else (kw or ''))
+    with st.expander(f'📋 全コード一覧（カテゴリ{n_cats}／コード{len(rows)}）', expanded=expanded):
+        df = pd.DataFrame(rows)
         st.dataframe(df, width='stretch', hide_index=True)
 
 
@@ -1039,55 +1049,38 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
     return codebook
 
 
-def _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text):
-    """Step2（全件コーディング）＋Step3（集計）の共通処理。トークン使用量の集計は呼び出し側で行う"""
-    total = len(all_items)
-    codes = [
-        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-        for cat in codebook.get('categories', [])
-        for c in cat.get('codes', [])
-    ]
-    status_text.markdown(f'**Step 1/3** コードブック完成：{len(codes)}コード ✓')
-    progress_bar.progress(0.30)
+CODING_SCOPE_OPTIONS = ['コーディングしない（策定のみ）', '100件でコーディング', '200件でコーディング', '全件コーディング']
+CODING_SCOPE_SIZES   = {
+    'コーディングしない（策定のみ）': 0,
+    '100件でコーディング':          100,
+    '200件でコーディング':          200,
+    '全件コーディング':              None,  # Noneは実行時に全件数へ解決
+}
 
-    # ── Step2: 全件コーディング ───────────────────────────────────
-    status_text.markdown('**Step 2/3** 全件コーディング中...')
+
+def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90):
+    """itemsをコーディングし、結果リストを返す（集計は行わない）"""
+    if not items:
+        return []
     BATCH   = 15
     results = []
-    batches = [all_items[i:i+BATCH] for i in range(0, total, BATCH)]
+    batches = [items[i:i+BATCH] for i in range(0, len(items), BATCH)]
     for bi, batch in enumerate(batches):
         res = llm_code_batch(client, batch, codes, q_name)
         results.extend(res)
-        pct = 0.30 + 0.60 * ((bi+1) / len(batches))
-        progress_bar.progress(min(pct, 0.90))
-        status_text.markdown(f'**Step 2/3** コーディング中... {bi+1}/{len(batches)}バッチ')
+        pct = p_start + (p_end - p_start) * ((bi+1) / len(batches))
+        progress_bar.progress(min(pct, p_end))
+        status_text.markdown(f'**コーディング中...** {bi+1}/{len(batches)}バッチ')
         time.sleep(0.1)
-
-    status_text.markdown(f'**Step 2/3** コーディング完了：{len(results)}件 ✓')
-    progress_bar.progress(0.92)
-
-    # ── Step3: 集計 ───────────────────────────────────────────────
-    status_text.markdown('**Step 3/3** 集計中...')
-    gt, sent_counts, unassigned = aggregate_results(codes, results, total)
-    progress_bar.progress(1.0)
-    status_text.markdown('**✅ 分析完了！**')
-
-    return {
-        'codebook':   codebook,
-        'codes':      codes,
-        'results':    results,
-        'gt':         gt,
-        'sent':       sent_counts,
-        'unassigned': unassigned,
-        'total':      total,
-        'items':      all_items,
-    }
+    return results
 
 
-def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
-                       codebook_mode='A', existing_codebook=None):
-    """コードブック策定のみを実行し、全件コーディング・集計はスキップする（策定方式の試行／既存コードブックの編集用）"""
-
+def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
+                  codebook_mode='A', existing_codebook=None, sample_size=None):
+    """
+    コードブック策定（または既存コードブックの読み込み）を行い、指定件数だけコーディング・集計する。
+    sample_size=0: コーディングしない（策定のみ）／ None: 全件 ／ それ以外: min(sample_size, 全件数)件
+    """
     reset_token_usage()
     client = make_client('Anthropic', api_key)
     all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
@@ -1110,26 +1103,52 @@ def run_codebook_only(api_key, q_name, texts, max_codes, progress_bar, status_te
         for cat in codebook.get('categories', [])
         for c in cat.get('codes', [])
     ]
+    status_text.markdown(f'**コードブック完成：{len(codes)}コード ✓**')
+    progress_bar.progress(0.30)
+
+    total_items = len(all_items)
+    n = total_items if sample_size is None else min(sample_size, total_items)
+
+    results = _code_items(client, q_name, codes, all_items[:n], progress_bar, status_text)
+
+    status_text.markdown('**集計中...**')
+    gt, sent_counts, unassigned = aggregate_results(codes, results, n)
     progress_bar.progress(1.0)
-    status_text.markdown('**✅ コードブック生成完了！**')
+    status_text.markdown('**✅ 完了！**')
 
     usage = get_token_usage()
     return {
-        'codebook_only': True,
-        'codebook':      codebook,
-        'codes':         codes,
-        'items':         all_items,
-        'q_name':        q_name,
-        'usage':         usage,
+        'codebook':    codebook,
+        'codes':       codes,
+        'items':       all_items,
+        'results':     results,
+        'coded_count': n,
+        'total_items': total_items,
+        'gt':          gt,
+        'sent':        sent_counts,
+        'unassigned':  unassigned,
+        'q_name':      q_name,
+        'usage':       usage,
     }
 
 
-def run_coding_from_codebook(api_key, q_name, codebook, all_items, progress_bar, status_text, prior_usage=None):
-    """策定済み（生成済み・アップロード済み問わず）のコードブックを使って全件コーディング→集計のみ実行"""
+def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, progress_bar, status_text,
+                     prior_results=None, prior_usage=None):
+    """既存のコーディング結果に続けて、未コーディング分から追加でadd_size件をコーディングする"""
     reset_token_usage()
     client = make_client('Anthropic', api_key)
 
-    result = _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text)
+    total_items = len(all_items)
+    new_count   = min(coded_count + add_size, total_items)
+    new_items   = all_items[coded_count:new_count]
+
+    new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90)
+
+    status_text.markdown('**集計中...**')
+    results = (prior_results or []) + new_results
+    gt, sent_counts, unassigned = aggregate_results(codes, results, new_count)
+    progress_bar.progress(1.0)
+    status_text.markdown('**✅ 完了！**')
 
     usage = get_token_usage()
     if prior_usage:
@@ -1137,37 +1156,15 @@ def run_coding_from_codebook(api_key, q_name, codebook, all_items, progress_bar,
             'input':  usage.get('input', 0)  + prior_usage.get('input', 0),
             'output': usage.get('output', 0) + prior_usage.get('output', 0),
         }
-    result['usage'] = usage
-    return result
 
-
-def run_analysis(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
-                  codebook_mode='A', existing_codebook=None):
-    """コードブック策定（または既存コードブックの再利用）→全件コーディング→集計を実行"""
-
-    reset_token_usage()
-    client = make_client('Anthropic', api_key)
-    all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
-    random.shuffle(all_items)
-
-    # ── Step1: コードブック策定 ──────────────────────────────────
-    status_text.markdown('**Step 1/3** コードブックを生成中...')
-    codebook = _generate_codebook_step(
-        client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
-        codebook_mode, existing_codebook
-    )
-
-    if not codebook:
-        reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-        st.error(
-            'コードブック生成に失敗しました。再度お試しください。'
-            + f'\n\n詳細: {reason}'
-        )
-        return None
-
-    result = _code_and_aggregate(client, q_name, codebook, all_items, progress_bar, status_text)
-    result['usage'] = get_token_usage()
-    return result
+    return {
+        'results':     results,
+        'coded_count': new_count,
+        'gt':          gt,
+        'sent':        sent_counts,
+        'unassigned':  unassigned,
+        'usage':       usage,
+    }
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
@@ -1225,7 +1222,7 @@ with st.sidebar:
         existing_file = st.file_uploader(
             'コードブックファイル（CSV または JSON、過去バージョンも可）',
             type=['csv', 'json'],
-            help='「コードブックを表示」の表右上のツールバーからダウンロードしたCSV、'
+            help='「全コード一覧」の表右上のツールバーからダウンロードしたCSV、'
                  'または以前保存したJSONファイルを指定してください（過去のバージョンをアップロードして編集することもできます）'
         )
         if existing_file:
@@ -1242,13 +1239,17 @@ with st.sidebar:
                 st.error(f'ファイルの読み込みに失敗しました: {e}')
         st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
 
-    run_full_pipeline = st.checkbox(
-        'コーディングまで全て実行する',
-        value=False,
-        help='デフォルトではコードブック策定（または既存コードブックの読み込み）のみを行い、'
-             '内容を確認・編集してから「▶ コーディングを実行する」で続行できます。'
-             'チェックすると、策定から全件コーディング・集計まで一気に実行します。'
+    st.markdown('**🧮 コーディング範囲**')
+    coding_scope_label = st.radio(
+        'コーディング範囲',
+        CODING_SCOPE_OPTIONS,
+        index=1,
+        label_visibility='collapsed',
+        help='コードブック策定（または既存コードブックの読み込み）の後、どこまでコーディングするかを選びます。'
+             'まず少量でコーディングし、結果を見ながらコードブックを編集し、'
+             '納得できたら結果画面の「続きをコーディングする」や「全件コーディング」で範囲を広げる使い方を想定しています。'
     )
+    coding_sample_size = CODING_SCOPE_SIZES[coding_scope_label]
 
     st.divider()
     st.markdown('**📖 使い方**')
@@ -1346,7 +1347,7 @@ st.divider()
 
 # ── 分析実行 ──────────────────────────────────────
 mode_ready   = codebook_mode != 'EXISTING' or existing_codebook_data is not None
-button_label = '🚀 分析開始' if run_full_pipeline else '📐 コードブック生成開始'
+button_label = '📐 コードブック生成開始' if coding_sample_size == 0 else '🚀 分析開始'
 
 if st.button(button_label, type='primary', width='stretch',
              disabled=not (texts and q_name and api_key and mode_ready)):
@@ -1355,16 +1356,11 @@ if st.button(button_label, type='primary', width='stretch',
     status_text  = st.empty()
 
     with st.spinner('処理中...'):
-        if not run_full_pipeline:
-            result = run_codebook_only(
-                api_key, q_name, texts, max_codes,
-                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
-            )
-        else:
-            result = run_analysis(
-                api_key, q_name, texts, max_codes,
-                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data
-            )
+        result = run_pipeline(
+            api_key, q_name, texts, max_codes,
+            progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
+            coding_sample_size
+        )
 
     if result:
         st.session_state.history_counter += 1
@@ -1390,157 +1386,131 @@ if active_result:
     result = active_result
     q_name = active_q_name
 
-    if result.get('codebook_only'):
+    coded_count = result.get('coded_count', 0)
+    total_items = result.get('total_items', 0)
+
+    if coded_count == 0:
         st.success('✅ コードブックの生成が完了しました！')
-
-        usage = result.get('usage', {})
-        inp   = usage.get('input', 0)
-        out   = usage.get('output', 0)
-        cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
-        with st.expander('💰 API使用コスト（参考）'):
-            c1, c2, c3 = st.columns(3)
-            c1.metric('入力トークン', f'{inp:,}')
-            c2.metric('出力トークン', f'{out:,}')
-            c3.metric('推定コスト', f'約 ¥{cost:.0f}')
-            st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
-
-        st.divider()
-
-        render_codebook_table(result['codebook'], expanded=True)
-
-        st.divider()
-        st.markdown('#### 💬 コードブックを編集')
-        st.caption(
-            '⚠️ 編集すると現在の内容が置き換わります。保存しておきたい場合は、'
-            '上の表の右上ツールバーから先にCSVをダウンロードしてください。'
-        )
-
-        edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
-
-        if len(edit_log) > 1:
-            with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
-                for i, entry in enumerate(edit_log):
-                    n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
-                    hc1, hc2 = st.columns([4, 1])
-                    hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
-                    if i != len(edit_log) - 1:
-                        if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
-                            edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
-                            result['codebook'] = entry['codebook']
-                            result['codes'] = [
-                                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                                for cat in entry['codebook'].get('categories', [])
-                                for c in cat.get('codes', [])
-                            ]
-                            for h in st.session_state.history:
-                                if h['id'] == st.session_state.active_history_id:
-                                    h['result'] = result
-                                    break
-                            st.rerun()
-
-        for entry in edit_log[1:]:
-            with st.chat_message('user'):
-                st.write(entry['instruction'])
-            with st.chat_message('assistant'):
-                n_cats  = len(entry['codebook'].get('categories', []))
-                n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
-                st.write(f'更新しました（カテゴリ{n_cats}／コード{n_codes}）')
-
-        instruction = st.chat_input(
-            '編集の指示を入力（例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜）'
-        )
-        if instruction:
-            with st.spinner('編集中...'):
-                client  = make_client('Anthropic', api_key)
-                updated = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
-            if updated:
-                edit_log.append({'instruction': instruction, 'codebook': updated})
-                result['codebook'] = updated
-                result['codes'] = [
-                    {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                    for cat in updated.get('categories', [])
-                    for c in cat.get('codes', [])
-                ]
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
-                st.rerun()
-            else:
-                reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-                st.error(f'編集に失敗しました。再度お試しください。\n\n詳細: {reason}')
-
-        st.divider()
-        if st.button('▶ コーディングを実行する', type='primary', width='stretch'):
-            progress_bar2 = st.progress(0)
-            status_text2  = st.empty()
-            with st.spinner('コーディング中...'):
-                continued = run_coding_from_codebook(
-                    api_key, result.get('q_name', q_name), result['codebook'], result['items'],
-                    progress_bar2, status_text2, prior_usage=result.get('usage')
-                )
-            if continued:
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = continued
-                        break
-                st.rerun()
-
+    elif coded_count < total_items:
+        st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
     else:
         st.success('✅ 分析が完了しました！')
 
-        # コスト表示
-        usage = result.get('usage', {})
-        inp   = usage.get('input', 0)
-        out   = usage.get('output', 0)
-        cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
-        with st.expander('💰 API使用コスト（参考）'):
-            c1, c2, c3 = st.columns(3)
-            c1.metric('入力トークン', f'{inp:,}')
-            c2.metric('出力トークン', f'{out:,}')
-            c3.metric('推定コスト', f'約 ¥{cost:.0f}')
-            st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
+    # コスト表示（共通）
+    usage = result.get('usage', {})
+    inp   = usage.get('input', 0)
+    out   = usage.get('output', 0)
+    cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
+    with st.expander('💰 API使用コスト（参考）'):
+        c1, c2, c3 = st.columns(3)
+        c1.metric('入力トークン', f'{inp:,}')
+        c2.metric('出力トークン', f'{out:,}')
+        c3.metric('推定コスト', f'約 ¥{cost:.0f}')
+        st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
 
-        render_codebook_table(result['codebook'])
+    # 全コード一覧（件数・出現率・キーワード込み。未コーディングのコードは0表示）
+    gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
+    render_codebook_table(result['codebook'], gt_by_code=gt_by_code, expanded=(coded_count == 0))
 
-        st.divider()
+    st.divider()
 
-        # ── 結果表示 ──────────────────────────────
-        st.subheader('📊 分析結果')
+    # ── コードブック編集チャット（コーディング前後を問わず常時利用可） ──
+    st.markdown('#### 💬 コードブックを編集')
+    st.caption(
+        '⚠️ 編集すると現在の内容が置き換わります。コーディング済みの結果には自動反映されません'
+        '（反映するには下の「続きをコーディングする」などで再度コーディングしてください）。'
+        '保存しておきたい場合は、上の表の右上ツールバーから先にCSVをダウンロードしてください。'
+    )
 
-        # センチメント集計
+    edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
+
+    if len(edit_log) > 1:
+        with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
+            for i, entry in enumerate(edit_log):
+                n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
+                hc1, hc2 = st.columns([4, 1])
+                hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
+                if i != len(edit_log) - 1:
+                    if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
+                        edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
+                        result['codebook'] = entry['codebook']
+                        result['codes'] = [
+                            {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                            for cat in entry['codebook'].get('categories', [])
+                            for c in cat.get('codes', [])
+                        ]
+                        for h in st.session_state.history:
+                            if h['id'] == st.session_state.active_history_id:
+                                h['result'] = result
+                                break
+                        st.rerun()
+
+    for entry in edit_log[1:]:
+        with st.chat_message('user'):
+            st.write(entry['instruction'])
+        with st.chat_message('assistant'):
+            n_cats  = len(entry['codebook'].get('categories', []))
+            n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
+            st.write(f'更新しました（カテゴリ{n_cats}／コード{n_codes}）')
+
+    instruction = st.chat_input(
+        '編集の指示を入力（例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜）'
+    )
+    if instruction:
+        with st.spinner('編集中...'):
+            client  = make_client('Anthropic', api_key)
+            updated = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
+        if updated:
+            edit_log.append({'instruction': instruction, 'codebook': updated})
+            result['codebook'] = updated
+            result['codes'] = [
+                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                for cat in updated.get('categories', [])
+                for c in cat.get('codes', [])
+            ]
+            for h in st.session_state.history:
+                if h['id'] == st.session_state.active_history_id:
+                    h['result'] = result
+                    break
+            st.rerun()
+        else:
+            reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+            st.error(f'編集に失敗しました。再度お試しください。\n\n詳細: {reason}')
+
+    st.divider()
+
+    # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
+    if coded_count > 0:
+        st.subheader('📊 コーディング結果')
+
         st.markdown('#### 😊 センチメント集計')
         c1, c2, c3, c4 = st.columns(4)
-        total      = result['total']
         sent       = result['sent']
         unassigned = result.get('unassigned', 0)
         with c1:
             cnt = sent['positive']
-            st.metric('ポジティブ', f'{cnt}件', f'{cnt/total*100:.1f}%')
+            st.metric('ポジティブ', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
         with c2:
             cnt = sent['negative']
-            st.metric('ネガティブ', f'{cnt}件', f'{cnt/total*100:.1f}%')
+            st.metric('ネガティブ', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
         with c3:
             cnt = sent['neutral']
-            st.metric('ニュートラル', f'{cnt}件', f'{cnt/total*100:.1f}%')
+            st.metric('ニュートラル', f'{cnt}件', f'{cnt/coded_count*100:.1f}%')
         with c4:
-            st.metric('非該当（コードなし）', f'{unassigned}件', f'{unassigned/total*100:.1f}%')
+            st.metric('非該当（コードなし）', f'{unassigned}件', f'{unassigned/coded_count*100:.1f}%')
 
         st.divider()
 
-        # GT集計
         st.markdown('#### 📈 コード別GT集計')
         gt = result['gt']
         import pandas as pd
 
-        # 表示順の切り替え
         sort_mode = st.radio(
             '表示順',
             ['順A：カテゴリ出現率順→コード出現率順', '順B：コード出現率が多い順'],
             horizontal=True
         )
 
-        # カテゴリ別出現数を集計
         cat_total = {}
         for item in gt:
             cat_total[item['cat_id']] = cat_total.get(item['cat_id'], 0) + item['count']
@@ -1550,7 +1520,6 @@ if active_result:
         else:
             gt_sorted = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
 
-        # plotlyでカテゴリ別色分けグラフ
         import plotly.express as px
         df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
         df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
@@ -1568,9 +1537,8 @@ if active_result:
             height=500,
             margin=dict(b=120),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
-        # カテゴリ集計
         with st.expander('カテゴリ別集計を表示'):
             cat_summary = {}
             for item in gt_sorted:
@@ -1579,23 +1547,17 @@ if active_result:
                     cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
                 cat_summary[cid]['件数'] += item['count']
             df_cat = pd.DataFrame(list(cat_summary.values()))
-            df_cat['出現率(%)'] = (df_cat['件数'] / total * 100).round(1)
+            df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
             df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
-            st.dataframe(df_cat, use_container_width=True, hide_index=True)
-
-        # 全コード一覧
-        with st.expander('全コード一覧を表示'):
-            df_full = pd.DataFrame(gt_sorted)[['cat_name','code_id','code_name','count','pct','definition']]
-            df_full.columns = ['カテゴリ','コードID','コード名','件数','出現率(%)','定義']
-            st.dataframe(df_full, use_container_width=True, hide_index=True)
+            st.dataframe(df_cat, width='stretch', hide_index=True)
 
         st.divider()
 
-        # Excel ダウンロード
-        st.markdown('#### 💾 レポートのダウンロード')
+        partial_note = '' if coded_count >= total_items else f'（{coded_count}/{total_items}件分）'
+        st.markdown(f'#### 💾 レポートのダウンロード{partial_note}')
         excel_bytes = create_excel(
-            q_name, gt, sent, total,
-            result['results'], result['items'], result['codes'], unassigned
+            q_name, gt, sent, coded_count,
+            result['results'], result['items'][:coded_count], result['codes'], unassigned
         )
         st.download_button(
             label='📥 Excelレポートをダウンロード',
@@ -1604,3 +1566,38 @@ if active_result:
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             width='stretch',
         )
+
+    # ── 続きをコーディングする ──────────────────────────────────
+    if coded_count < total_items:
+        st.divider()
+        st.markdown('#### ▶ 続きをコーディングする')
+        remaining = total_items - coded_count
+        add_options = []
+        if remaining > 100:
+            add_options.append(('100件追加', 100))
+        if remaining > 200:
+            add_options.append(('200件追加', 200))
+        add_options.append((f'残り全て（{remaining}件）', remaining))
+
+        add_label = st.radio(
+            '追加でコーディングする件数',
+            [o[0] for o in add_options],
+            label_visibility='collapsed',
+        )
+        add_size = dict(add_options)[add_label]
+
+        if st.button(f'▶ {add_label}', type='primary', width='stretch'):
+            progress_bar2 = st.progress(0)
+            status_text2  = st.empty()
+            with st.spinner('コーディング中...'):
+                continued = continue_coding(
+                    api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                    coded_count, add_size, progress_bar2, status_text2,
+                    prior_results=result.get('results', []), prior_usage=result.get('usage'),
+                )
+            result.update(continued)
+            for h in st.session_state.history:
+                if h['id'] == st.session_state.active_history_id:
+                    h['result'] = result
+                    break
+            st.rerun()
