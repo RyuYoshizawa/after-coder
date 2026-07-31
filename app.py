@@ -523,43 +523,60 @@ def aggregate_results(codes, results, total):
 CODEBOOK_CSV_COLUMNS = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード']
 
 
-def render_codebook_table(codebook, gt_by_code=None, expanded=False):
-    """
-    コードブックを「全コード一覧」として折りたたみ表示する（旧・コードブック表示と全コード一覧を統合）。
-    列順は 件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード。
-    gt_by_code（code_id -> {'count':int,'pct':float}）を渡すとその値を、渡さない／未コーディングの
-    コードは件数・出現率とも0として表示する。
-    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる
-    （件数・出現率列は再読み込み時に無視される）。
-    """
-    import pandas as pd
+def _codebook_rows(codebook, gt_by_code=None, include_stats=False):
+    """コードブックをカテゴリ→コードの行データ（dictのリスト）に変換する共通処理"""
     gt_by_code = gt_by_code or {}
     rows = []
     for cat in codebook.get('categories', []):
         for c in cat.get('codes', []):
-            stat = gt_by_code.get(c.get('code_id'), {})
             keywords = c.get('keywords', [])
             if isinstance(keywords, list):
                 keywords = '; '.join(keywords)
-            rows.append({
-                '件数':       stat.get('count', 0),
-                '出現率(%)':  stat.get('pct', 0.0),
+            row = {
                 'カテゴリID': cat.get('cat_id', ''),
                 'カテゴリ名': cat.get('cat_name', ''),
                 'コードID':   c.get('code_id', ''),
                 'コード名':   c.get('code_name', ''),
                 '定義':       c.get('definition', ''),
                 'キーワード': keywords or '',
-            })
+            }
+            if include_stats:
+                stat = gt_by_code.get(c.get('code_id'), {})
+                row = {'件数': stat.get('count', 0), '出現率(%)': stat.get('pct', 0.0), **row}
+            rows.append(row)
+    return rows
+
+
+def render_codebook_structure(codebook):
+    """
+    コードブックの構造（カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード）のみを、
+    折りたたまず常時表示する。編集直後もその場で最新の内容が確認できる。
+    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる。
+    """
+    import pandas as pd
+    rows = _codebook_rows(codebook)
     n_cats = len(codebook.get('categories', []))
-    with st.expander(f'📋 全コード一覧（カテゴリ{n_cats}／コード{len(rows)}）', expanded=expanded):
-        df = pd.DataFrame(rows)
-        st.dataframe(df, width='stretch', hide_index=True)
+    st.caption(f'カテゴリ{n_cats}／コード{len(rows)}')
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+
+def render_code_list_table(codebook, gt_by_code=None, expanded=False):
+    """
+    コーディング結果に基づく「コード一覧集計」を折りたたみ表示する。
+    列順は 件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード。
+    gt_by_codeを渡さない、または未コーディングのコードは件数・出現率とも0として表示する。
+    """
+    import pandas as pd
+    rows = _codebook_rows(codebook, gt_by_code, include_stats=True)
+    n_cats = len(codebook.get('categories', []))
+    with st.expander(f'📋 コード一覧集計（カテゴリ{n_cats}／コード{len(rows)}）', expanded=expanded):
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 
 def parse_codebook_csv(file_bytes):
     """
-    render_codebook_tableの表からダウンロードしたCSV（カテゴリID,カテゴリ名,コードID,コード名,定義,キーワード）を
+    render_codebook_structure/render_code_list_tableの表からダウンロードしたCSV
+    （カテゴリID,カテゴリ名,コードID,コード名,定義,キーワード。件数・出現率列があっても無視する）を
     コードブック構造（{'categories': [...]}）に復元する
     """
     import pandas as pd
@@ -1222,7 +1239,7 @@ with st.sidebar:
         existing_file = st.file_uploader(
             'コードブックファイル（CSV または JSON、過去バージョンも可）',
             type=['csv', 'json'],
-            help='「全コード一覧」の表右上のツールバーからダウンロードしたCSV、'
+            help='「コードブック」または「コード一覧集計」の表右上のツールバーからダウンロードしたCSV、'
                  'または以前保存したJSONファイルを指定してください（過去のバージョンをアップロードして編集することもできます）'
         )
         if existing_file:
@@ -1408,22 +1425,73 @@ if active_result:
         c3.metric('推定コスト', f'約 ¥{cost:.0f}')
         st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
 
-    # 全コード一覧（件数・出現率・キーワード込み。未コーディングのコードは0表示）
-    gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
-    render_codebook_table(result['codebook'], gt_by_code=gt_by_code, expanded=(coded_count == 0))
+    # ── コードブック（構造のみ。折りたたまず常時表示、編集直後もその場で最新反映） ──
+    st.markdown('#### 📐 コードブック')
+    render_codebook_structure(result['codebook'])
 
-    st.divider()
-
-    # ── コードブック編集チャット（コーディング前後を問わず常時利用可） ──
-    st.markdown('#### 💬 コードブックを編集')
+    # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
     st.caption(
         '⚠️ 編集すると現在の内容が置き換わります。コーディング済みの結果には自動反映されません'
-        '（反映するには下の「続きをコーディングする」などで再度コーディングしてください）。'
+        '（反映するには下の「現在のコードブックでコーディングする」で再度コーディングしてください）。'
         '保存しておきたい場合は、上の表の右上ツールバーから先にCSVをダウンロードしてください。'
     )
+    with st.form('edit_instruction_form', clear_on_submit=True):
+        instruction = st.text_input(
+            '編集の指示を入力', label_visibility='collapsed',
+            placeholder='例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜'
+        )
+        submitted = st.form_submit_button('編集案を作成する', width='stretch')
 
+    if submitted and instruction:
+        with st.spinner('編集案を作成中...'):
+            client   = make_client('Anthropic', api_key)
+            proposed = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
+        if proposed:
+            result['pending_edit'] = {'instruction': instruction, 'codebook': proposed}
+            for h in st.session_state.history:
+                if h['id'] == st.session_state.active_history_id:
+                    h['result'] = result
+                    break
+            st.rerun()
+        else:
+            reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+            st.error(f'編集案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+
+    # ── 編集案のプレビュー（確定・キャンセルの2段階確認） ──────────
+    pending_edit = result.get('pending_edit')
+    if pending_edit:
+        st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
+        render_codebook_structure(pending_edit['codebook'])
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            if st.button('✅ この内容で確定する', type='primary', width='stretch'):
+                edit_log = result.setdefault(
+                    'edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}]
+                )
+                edit_log.append({'instruction': pending_edit['instruction'], 'codebook': pending_edit['codebook']})
+                result['codebook'] = pending_edit['codebook']
+                result['codes'] = [
+                    {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                    for cat in pending_edit['codebook'].get('categories', [])
+                    for c in cat.get('codes', [])
+                ]
+                del result['pending_edit']
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+        with pc2:
+            if st.button('❌ キャンセル', width='stretch'):
+                del result['pending_edit']
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+
+    # ── 編集履歴 ──────────────────────────────────────────
     edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
-
     if len(edit_log) > 1:
         with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
             for i, entry in enumerate(edit_log):
@@ -1445,39 +1513,30 @@ if active_result:
                                 break
                         st.rerun()
 
-    for entry in edit_log[1:]:
-        with st.chat_message('user'):
-            st.write(entry['instruction'])
-        with st.chat_message('assistant'):
-            n_cats  = len(entry['codebook'].get('categories', []))
-            n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
-            st.write(f'更新しました（カテゴリ{n_cats}／コード{n_codes}）')
-
-    instruction = st.chat_input(
-        '編集の指示を入力（例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜）'
-    )
-    if instruction:
-        with st.spinner('編集中...'):
-            client  = make_client('Anthropic', api_key)
-            updated = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
-        if updated:
-            edit_log.append({'instruction': instruction, 'codebook': updated})
-            result['codebook'] = updated
-            result['codes'] = [
-                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                for cat in updated.get('categories', [])
-                for c in cat.get('codes', [])
-            ]
-            for h in st.session_state.history:
-                if h['id'] == st.session_state.active_history_id:
-                    h['result'] = result
-                    break
-            st.rerun()
-        else:
-            reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-            st.error(f'編集に失敗しました。再度お試しください。\n\n詳細: {reason}')
-
     st.divider()
+
+    # ── 現在のコードブックでコーディングする（1ボタン） ──────────────
+    if coded_count < total_items:
+        if pending_edit:
+            st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
+        else:
+            remaining = total_items - coded_count
+            if st.button(f'▶ 現在のコードブックでコーディングする（残り{remaining}件）', type='primary', width='stretch'):
+                progress_bar2 = st.progress(0)
+                status_text2  = st.empty()
+                with st.spinner('コーディング中...'):
+                    continued = continue_coding(
+                        api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                        coded_count, remaining, progress_bar2, status_text2,
+                        prior_results=result.get('results', []), prior_usage=result.get('usage'),
+                    )
+                result.update(continued)
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+        st.divider()
 
     # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
     if coded_count > 0:
@@ -1551,6 +1610,9 @@ if active_result:
             df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
             st.dataframe(df_cat, width='stretch', hide_index=True)
 
+        gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in gt}
+        render_code_list_table(result['codebook'], gt_by_code=gt_by_code)
+
         st.divider()
 
         partial_note = '' if coded_count >= total_items else f'（{coded_count}/{total_items}件分）'
@@ -1566,38 +1628,3 @@ if active_result:
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             width='stretch',
         )
-
-    # ── 続きをコーディングする ──────────────────────────────────
-    if coded_count < total_items:
-        st.divider()
-        st.markdown('#### ▶ 続きをコーディングする')
-        remaining = total_items - coded_count
-        add_options = []
-        if remaining > 100:
-            add_options.append(('100件追加', 100))
-        if remaining > 200:
-            add_options.append(('200件追加', 200))
-        add_options.append((f'残り全て（{remaining}件）', remaining))
-
-        add_label = st.radio(
-            '追加でコーディングする件数',
-            [o[0] for o in add_options],
-            label_visibility='collapsed',
-        )
-        add_size = dict(add_options)[add_label]
-
-        if st.button(f'▶ {add_label}', type='primary', width='stretch'):
-            progress_bar2 = st.progress(0)
-            status_text2  = st.empty()
-            with st.spinner('コーディング中...'):
-                continued = continue_coding(
-                    api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                    coded_count, add_size, progress_bar2, status_text2,
-                    prior_results=result.get('results', []), prior_usage=result.get('usage'),
-                )
-            result.update(continued)
-            for h in st.session_state.history:
-                if h['id'] == st.session_state.active_history_id:
-                    h['result'] = result
-                    break
-            st.rerun()
