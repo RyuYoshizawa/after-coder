@@ -20,10 +20,14 @@ from llm_client import call_llm, make_client, reset_token_usage, get_token_usage
 
 APP_DIR = Path(__file__).parent
 
-# コードブック策定・編集は判断の質が重要なためSonnet、
-# コーディング（既存コードブックへの分類作業）は定型的なためHaikuを使い、コストを抑える。
+# コードブック策定・編集は判断の質が重要なためSonnet固定。
+# コーディング（既存コードブックへの分類作業）はサイドバーで選択可能（精度・価格比較のため）。
 CODEBOOK_MODEL = 'claude-sonnet-4-6'
-CODING_MODEL   = 'claude-haiku-4-5'
+CODING_MODEL   = 'claude-haiku-4-5'  # コーディングモデルのデフォルト（サイドバー未選択時など）
+CODING_MODEL_OPTIONS = {
+    'Haiku 4.5（安い・高速）':   'claude-haiku-4-5',
+    'Sonnet 4.6（高精度・高コスト）': 'claude-sonnet-4-6',
+}
 
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
@@ -392,12 +396,14 @@ code_idは既存コードと同じC0101形式で採番すること（接頭辞�
     return result.get('new_codes', [])
 
 
-def llm_code_batch(client, items, codes, q_name):
+def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL):
     """
     コーディング本体。同じコードブック（system側）を1回のコーディング実行中に何十回も
     使い回すため、コードブック・ルールをsystemに分離しcache_control（プロンプトキャッシュ）を
     効かせ、2回目以降のバッチでコードブック分のコストを大幅に削減する。
-    分類作業でありコードブック生成ほどの判断力を要さないため、モデルもHaiku（CODING_MODEL）を使う。
+    modelはサイドバーの「コーディングモデル」選択に従う（デフォルトはHaiku=CODING_MODEL）。
+    精度・価格を比較したい場合は、同じコードブックのまま方式を変えて2回実行し、
+    作業履歴で比較する使い方を想定している。
     """
     code_list = '\n'.join(
         f'{c["code_id"]}（{c["cat_name"]}）: {c["code_name"]} / {c["definition"][:25]}'
@@ -435,7 +441,7 @@ def llm_code_batch(client, items, codes, q_name):
         },
         'required': ['results'],
     }
-    result = call_llm(client, prompt, schema, 'Anthropic', CODING_MODEL,
+    result = call_llm(client, prompt, schema, 'Anthropic', model,
                        system=system_prompt, cache_system=True)
     if result and isinstance(result, dict):
         return result.get('results', [])
@@ -1092,7 +1098,8 @@ CODING_SCOPE_SIZES   = {
 }
 
 
-def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90):
+def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90,
+                 coding_model=CODING_MODEL):
     """itemsをコーディングし、結果リストを返す（集計は行わない）"""
     if not items:
         return []
@@ -1100,7 +1107,7 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
     results = []
     batches = [items[i:i+BATCH] for i in range(0, len(items), BATCH)]
     for bi, batch in enumerate(batches):
-        res = llm_code_batch(client, batch, codes, q_name)
+        res = llm_code_batch(client, batch, codes, q_name, model=coding_model)
         results.extend(res)
         pct = p_start + (p_end - p_start) * ((bi+1) / len(batches))
         progress_bar.progress(min(pct, p_end))
@@ -1110,10 +1117,12 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
 
 
 def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
-                  codebook_mode='A', existing_codebook=None, sample_size=None):
+                  codebook_mode='A', existing_codebook=None, sample_size=None, coding_model=CODING_MODEL):
     """
     コードブック策定（または既存コードブックの読み込み）を行い、指定件数だけコーディング・集計する。
     sample_size=0: コーディングしない（策定のみ）／ None: 全件 ／ それ以外: min(sample_size, 全件数)件
+    coding_modelはこの分析（result）に紐づけて保存し、続きをコーディングする際も同じモデルを使う
+    （分析の途中でモデルが混在しないようにするため。精度・価格比較は分析単位で行う想定）。
     """
     reset_token_usage()
     client = make_client('Anthropic', api_key)
@@ -1143,7 +1152,8 @@ def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     total_items = len(all_items)
     n = total_items if sample_size is None else min(sample_size, total_items)
 
-    results = _code_items(client, q_name, codes, all_items[:n], progress_bar, status_text)
+    results = _code_items(client, q_name, codes, all_items[:n], progress_bar, status_text,
+                           coding_model=coding_model)
 
     status_text.markdown('**集計中...**')
     gt, sent_counts, unassigned = aggregate_results(codes, results, n)
@@ -1152,22 +1162,23 @@ def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, d
 
     usage = get_token_usage()
     return {
-        'codebook':    codebook,
-        'codes':       codes,
-        'items':       all_items,
-        'results':     results,
-        'coded_count': n,
-        'total_items': total_items,
-        'gt':          gt,
-        'sent':        sent_counts,
-        'unassigned':  unassigned,
-        'q_name':      q_name,
-        'usage':       usage,
+        'codebook':     codebook,
+        'codes':        codes,
+        'items':        all_items,
+        'results':      results,
+        'coded_count':  n,
+        'total_items':  total_items,
+        'gt':           gt,
+        'sent':         sent_counts,
+        'unassigned':   unassigned,
+        'q_name':       q_name,
+        'usage':        usage,
+        'coding_model': coding_model,
     }
 
 
 def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, progress_bar, status_text,
-                     prior_results=None, prior_usage=None):
+                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL):
     """既存のコーディング結果に続けて、未コーディング分から追加でadd_size件をコーディングする"""
     reset_token_usage()
     client = make_client('Anthropic', api_key)
@@ -1176,7 +1187,8 @@ def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, pr
     new_count   = min(coded_count + add_size, total_items)
     new_items   = all_items[coded_count:new_count]
 
-    new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90)
+    new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90,
+                               coding_model=coding_model)
 
     status_text.markdown('**集計中...**')
     results = (prior_results or []) + new_results
@@ -1288,6 +1300,16 @@ with st.sidebar:
     )
     coding_sample_size = CODING_SCOPE_SIZES[coding_scope_label]
 
+    coding_model_label = st.selectbox(
+        'コーディングモデル',
+        list(CODING_MODEL_OPTIONS.keys()),
+        index=0,
+        help='コーディング（分類作業）に使うモデルを選びます。Haiku 4.5はSonnet 4.6の約1/3の単価です。'
+             '精度・価格を比較したい場合は、同じコードブックのまま方式を変えて2回実行し、'
+             '「📜 作業履歴」で結果とコストを見比べてください（1回の分析中でモデルが混在することはありません）。'
+    )
+    coding_model = CODING_MODEL_OPTIONS[coding_model_label]
+
     st.divider()
     st.markdown('**📖 使い方**')
     st.markdown('''
@@ -1375,6 +1397,7 @@ with col2:
         st.markdown(f'**回答数：** {len(texts)}件')
         st.markdown(f'**コード上限：** {max_codes}個')
         st.markdown(f'**策定方式：** {codebook_mode_label}')
+        st.markdown(f'**コーディングモデル：** {coding_model_label}')
         st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
         est_min = max(3, len(texts) // 100 * 2)
         st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
@@ -1396,7 +1419,7 @@ if st.button(button_label, type='primary', width='stretch',
         result = run_pipeline(
             api_key, q_name, texts, max_codes,
             progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
-            coding_sample_size
+            coding_sample_size, coding_model
         )
 
     if result:
@@ -1432,6 +1455,11 @@ if active_result:
         st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
     else:
         st.success('✅ 分析が完了しました！')
+
+    if coded_count > 0:
+        used_model = result.get('coding_model', CODING_MODEL)
+        used_label = next((k for k, v in CODING_MODEL_OPTIONS.items() if v == used_model), used_model)
+        st.caption(f'🧮 この分析のコーディングモデル：{used_label}（作業履歴から他の分析と比較できます）')
 
     # コスト表示（共通。プロンプトキャッシュの読み込み/書き込み分は呼び出し時点のモデル単価で
     # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）
@@ -1559,6 +1587,7 @@ if active_result:
                         api_key, result.get('q_name', q_name), result['codes'], result['items'],
                         coded_count, remaining, progress_bar2, status_text2,
                         prior_results=result.get('results', []), prior_usage=result.get('usage'),
+                        coding_model=result.get('coding_model', CODING_MODEL),
                     )
                 result.update(continued)
                 for h in st.session_state.history:
@@ -1575,6 +1604,7 @@ if active_result:
                         api_key, result.get('q_name', q_name), result['codes'], result['items'],
                         0, total_items, progress_bar3, status_text3,
                         prior_results=None, prior_usage=result.get('usage'),
+                        coding_model=result.get('coding_model', CODING_MODEL),
                     )
                 result.update(recoded)
                 for h in st.session_state.history:
