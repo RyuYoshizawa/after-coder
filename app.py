@@ -15,6 +15,9 @@ import openpyxl
 from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.marker import DataPoint
+from openpyxl.chart.shapes import GraphicalProperties
 from datetime import datetime
 from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, get_last_error
 
@@ -28,6 +31,17 @@ CODING_MODEL_OPTIONS = {
     'Haiku 4.5（安い・高速）':   'claude-haiku-4-5',
     'Sonnet 4.6（高精度・高コスト）': 'claude-sonnet-4-6',
 }
+
+# リスクチェック項目。チェックした項目だけをコーディング時にAIへ問い合わせる（未チェックはコスト0）。
+# key: 内部フィールド名（LLMスキーマ・result内で使用） / label: UI表示名
+# char: Excel「回答別コーディング結果」の一文字見出し（チャンクB用） / hint: チェックの説明
+RISK_CHECK_OPTIONS = [
+    {'key': 'claim',    'label': 'クレーム',   'char': 'ク', 'hint': '強いクレーム'},
+    {'key': 'personal', 'label': '個人情報',   'char': '個', 'hint': '個人名・メールアドレス・電話番号'},
+    {'key': 'address',  'label': '住所情報',   'char': '住', 'hint': '詳細住所'},
+    {'key': 'org',       'label': '団体情報',   'char': '団', 'hint': '学校名・病院名・施設名'},
+    {'key': 'danger',    'label': '危険情報',   'char': '危', 'hint': '犯罪予告、自死予告、強い恨み'},
+]
 
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
@@ -396,7 +410,7 @@ code_idは既存コードと同じC0101形式で採番すること（接頭辞�
     return result.get('new_codes', [])
 
 
-def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL):
+def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_risks=None):
     """
     コーディング本体。同じコードブック（system側）を1回のコーディング実行中に何十回も
     使い回すため、コードブック・ルールをsystemに分離しcache_control（プロンプトキャッシュ）を
@@ -404,11 +418,24 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL):
     modelはサイドバーの「コーディングモデル」選択に従う（デフォルトはHaiku=CODING_MODEL）。
     精度・価格を比較したい場合は、同じコードブックのまま方式を変えて2回実行し、
     作業履歴で比較する使い方を想定している。
+    enabled_risksはサイドバーの「リスクチェック」でチェックされた項目のkeyのリスト。
+    未チェックの項目はプロンプト・スキーマに一切含めない（AIへの問い合わせ自体をしない＝コスト増なし）。
     """
+    enabled_risks = enabled_risks or []
+    risk_opts = [o for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
+
     code_list = '\n'.join(
         f'{c["code_id"]}（{c["cat_name"]}）: {c["code_name"]} / {c["definition"][:25]}'
         for c in codes
     )
+    risk_rule = ''
+    if risk_opts:
+        risk_lines = '\n'.join(f"- {o['label']}: {o['hint']}" for o in risk_opts)
+        risk_rule = f"""
+
+【リスクチェック】次の該当有無も回答ごとに判定してください（該当すればtrue、しなければfalse）
+{risk_lines}"""
+
     system_prompt = f"""「{q_name}」の回答にコードブックに基づいてコーディングしてください。
 
 【コードブック】
@@ -417,11 +444,19 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL):
 【ルール】
 - 1回答に複数コード付与可
 - 該当なしはcodesを空配列
-- sentimentは positive/negative/neutral"""
+- sentimentは positive/negative/neutral{risk_rule}"""
 
     items_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
     prompt = f"""【回答】
 {items_text}"""
+
+    result_properties = {
+        'id':        {'type': 'string'},
+        'codes':     {'type': 'array', 'items': {'type': 'string'}},
+        'sentiment': {'type': 'string', 'enum': ['positive','negative','neutral']},
+    }
+    for o in risk_opts:
+        result_properties[o['key']] = {'type': 'boolean'}
 
     schema = {
         'type': 'object',
@@ -430,11 +465,7 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL):
                 'type': 'array',
                 'items': {
                     'type': 'object',
-                    'properties': {
-                        'id':        {'type': 'string'},
-                        'codes':     {'type': 'array', 'items': {'type': 'string'}},
-                        'sentiment': {'type': 'string', 'enum': ['positive','negative','neutral']},
-                    },
+                    'properties': result_properties,
                     'required': ['id', 'codes', 'sentiment'],
                 }
             }
@@ -504,10 +535,15 @@ def llm_edit_codebook(client, codebook, instruction, q_name):
 # 集計・Excel出力関数
 # ══════════════════════════════════════════════════
 
-def aggregate_results(codes, results, total):
-    """コード別GT集計とセンチメント集計・非該当（どのコードも付与されなかった回答）件数を算出"""
+def aggregate_results(codes, results, total, risk_keys=None):
+    """
+    コード別GT集計とセンチメント集計・非該当（どのコードも付与されなかった回答）件数、
+    リスクチェック（risk_keysで有効な項目のみ）の該当件数を算出
+    """
+    risk_keys   = risk_keys or []
     code_counts = {c['code_id']: 0 for c in codes}
     sent_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
+    risk_counts = {k: 0 for k in risk_keys}
     result_map  = {r['id']: r for r in results}
     unassigned  = 0
 
@@ -521,6 +557,9 @@ def aggregate_results(codes, results, total):
         for cid in res_codes:
             if cid in code_counts:
                 code_counts[cid] += 1
+        for k in risk_keys:
+            if res.get(k):
+                risk_counts[k] += 1
 
     gt = []
     for cat in codes:
@@ -536,7 +575,7 @@ def aggregate_results(codes, results, total):
             'definition':cat.get('definition', ''),
         })
     gt.sort(key=lambda x: x['count'], reverse=True)
-    return gt, sent_counts, unassigned
+    return gt, sent_counts, unassigned, risk_counts
 
 
 CODEBOOK_CSV_COLUMNS = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '定義', 'キーワード']
@@ -633,8 +672,17 @@ def parse_codebook_csv(file_bytes):
     return {'categories': list(categories.values())}
 
 
-def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassigned=0):
-    """ローカル版仮集計シートと同じレイアウトでExcelを生成"""
+def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassigned=0,
+                  risk_counts=None, enabled_risks=None):
+    """
+    ローカル版仮集計シートと同じレイアウトでExcelを生成。
+    リスクチェック（risk_counts/enabled_risks）は「特記情報集計」への項目追加と、
+    「回答別コーディング結果」の一文字フラグ列（非該当＋有効化されたリスク項目）に反映する。
+    """
+    risk_counts   = risk_counts or {}
+    enabled_risks = enabled_risks or []
+    risk_opts     = [o for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
+
     wb  = openpyxl.Workbook()
     ws  = wb.active
     ws.title = '集計レポート'
@@ -650,13 +698,27 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     LOW_FILL  = PatternFill('solid', start_color='FCE4D6', end_color='FCE4D6')
     FLAG_FILL = PatternFill('solid', start_color='BDD7EE', end_color='BDD7EE')
 
-    # カテゴリ別カラーパレット
-    cat_colors = [
-        'D9E2F3','FCE4D6','E2EFDA','FFF2CC','EDEDED',
-        'F4CCCC','D0E4F5','EAD1DC','D9D2E9','CFE2F3'
-    ]
-    cat_ids   = list(dict.fromkeys(c['cat_id'] for c in codes))
-    cat_color = {cid: cat_colors[i % len(cat_colors)] for i, cid in enumerate(cat_ids)}
+    # カテゴリ別カラー：画面の縦棒グラフ（Plotlyデフォルト配色、カテゴリ出現率の多い順に割当）と
+    # 同じ色を使う。「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
+    PLOTLY_COLORS = ['636EFA','EF553B','00CC96','AB63FA','FFA15A',
+                      '19D3F3','FF6692','B6E880','FF97FF','FECB52']
+
+    def _lighten_hex(hex_color, factor=0.65):
+        """指定した割合(0〜1)だけ白に近づけた淡い色を返す"""
+        r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
+        r = round(r + (255 - r) * factor)
+        g = round(g + (255 - g) * factor)
+        b = round(b + (255 - b) * factor)
+        return f'{r:02X}{g:02X}{b:02X}'
+
+    cat_total = {}
+    for g in gt:
+        cat_total[g['cat_id']] = cat_total.get(g['cat_id'], 0) + g['count']
+    for c in codes:
+        cat_total.setdefault(c['cat_id'], 0)
+    cat_order      = sorted(cat_total, key=lambda cid: -cat_total[cid])
+    cat_color_full = {cid: PLOTLY_COLORS[i % len(PLOTLY_COLORS)] for i, cid in enumerate(cat_order)}
+    cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
 
     def hdr(r, c, v):
         cell = ws.cell(row=r, column=c, value=v)
@@ -681,11 +743,13 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             value=f'集計日時: {datetime.now().strftime("%Y/%m/%d %H:%M")}  有効回答数: {total}件').font = Font(
         name='Meiryo UI', size=10, color='808080')
 
-    FIXED_N    = 3   # 回答ID・回答テキスト・センチメントの3列
-    CODE_START = FIXED_N + 1  # D列からコード開始
+    # 回答別コーディング結果の固定列：回答ID・回答テキスト・センチメント＋フラグ列（非該当＋有効なリスクチェック項目）
+    FLAG_COLUMNS = [{'key': None, 'char': '非'}] + [{'key': o['key'], 'char': o['char']} for o in risk_opts]
+    FIXED_N    = 3 + len(FLAG_COLUMNS)
+    CODE_START = FIXED_N + 1
 
-    # ── センチメント集計（D5〜K6） ────────────────────────────────
-    ws.cell(row=4, column=1, value='■ センチメント集計').font = SUB_FONT
+    # ── 特記情報集計（センチメント＋非該当＋リスクチェック） ────────────
+    ws.cell(row=4, column=1, value='■ 特記情報集計').font = SUB_FONT
     sent_order = [('positive','ポジティブ'), ('negative','ネガティブ'), ('neutral','ニュートラル')]
     for i, (sent, label) in enumerate(sent_order):
         cnt = sent_counts[sent]
@@ -701,6 +765,17 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     dat(5, 5+len(sent_order)*2, unassigned)
     hdr(6, 4+len(sent_order)*2, '%')
     dat(6, 5+len(sent_order)*2, round(un_pct, 1))
+
+    # リスクチェック（有効化された項目のみ）
+    risk_base_col = 4 + (len(sent_order)+1)*2
+    for i, o in enumerate(risk_opts):
+        cnt = risk_counts.get(o['key'], 0)
+        pct = cnt / total * 100 if total > 0 else 0
+        col = risk_base_col + i*2
+        hdr(5, col, o['label'])
+        dat(5, col+1, cnt)
+        hdr(6, col, '%')
+        dat(6, col+1, round(pct, 1))
 
     # ── GT集計（転置レイアウト） ──────────────────────────────────
     GT_START  = 8
@@ -719,6 +794,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         'ネガティブ件数',
         'ニュートラル件数',
     ]
+    CAT_ID_ROW_INDEX = 1  # gt_labelsのうち「中間カテゴリID」の位置＝フル彩度で塗る行
     for i, label in enumerate(gt_labels):
         r = GT_START + 1 + i
         lbl(r, 1, label)
@@ -747,9 +823,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         cnt  = next((r['count'] for r in gt if r['code_id']==code['code_id']), 0)
         pct  = cnt / total * 100 if total > 0 else 0
         cs   = code_sent.get(code['code_id'], {'positive':0,'negative':0,'neutral':0})
-        fill = PatternFill('solid',
-                           start_color=cat_color.get(code['cat_id'], 'FFFFFF'),
-                           end_color=cat_color.get(code['cat_id'], 'FFFFFF'))
+        full = cat_color_full.get(code['cat_id'], 'FFFFFF')
+        pale = cat_color_pale.get(code['cat_id'], 'FFFFFF')
         vals = [
             cat_counts.get(code['cat_id'], 0),
             code['cat_id'],
@@ -768,7 +843,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             c = ws.cell(row=r, column=col, value=val)
             c.font=DATA_FONT; c.border=BORDER
             c.alignment = Alignment(wrap_text=True, vertical='top')
-            c.fill = fill
+            row_color = full if ri == CAT_ID_ROW_INDEX else pale
+            c.fill = PatternFill('solid', start_color=row_color, end_color=row_color)
             if ri == 6:  # 出現率
                 if pct >= 20:
                     c.fill = HIGH_FILL
@@ -785,14 +861,17 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     for ci, h in enumerate(['回答ID', '回答テキスト', 'センチメント']):
         hdr(hdr_row, 1+ci, h)
 
+    # フラグ列見出し（非該当＋有効化されたリスクチェック項目、一文字見出し）
+    for ci, fc in enumerate(FLAG_COLUMNS):
+        hdr(hdr_row, 4+ci, fc['char'])
+        ws.column_dimensions[get_column_letter(4+ci)].width = 4
+
     for ci, code in enumerate(codes):
         col  = CODE_START + ci
-        fill = PatternFill('solid',
-                           start_color=cat_color.get(code['cat_id'], 'FFFFFF'),
-                           end_color=cat_color.get(code['cat_id'], 'FFFFFF'))
+        full = cat_color_full.get(code['cat_id'], 'FFFFFF')
         c = ws.cell(row=hdr_row, column=col, value=code['code_id'])
         c.font = Font(name='Meiryo UI', bold=True, size=10, color='000000')
-        c.fill=fill; c.border=BORDER
+        c.fill = PatternFill('solid', start_color=full, end_color=full); c.border=BORDER
 
     item_map = {item['id']: item['text'] for item in items}
     for ri, res in enumerate(results):
@@ -803,20 +882,28 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         assigned = res.get('codes', [])
         for ci, val in enumerate([rid, text, sent]):
             dat(r, 1+ci, val)
+        for ci, fc in enumerate(FLAG_COLUMNS):
+            flagged = (not assigned) if fc['key'] is None else bool(res.get(fc['key']))
+            c = ws.cell(row=r, column=4+ci, value=1 if flagged else '')
+            c.font=DATA_FONT; c.border=BORDER
+            if flagged: c.fill = FLAG_FILL
         for ci, code in enumerate(codes):
             col  = CODE_START + ci
             flag = 1 if code['code_id'] in assigned else 0
-            fill = PatternFill('solid',
-                               start_color=cat_color.get(code['cat_id'], 'FFFFFF'),
-                               end_color=cat_color.get(code['cat_id'], 'FFFFFF'))
+            pale = cat_color_pale.get(code['cat_id'], 'FFFFFF')
             c = ws.cell(row=r, column=col, value=flag if flag else '')
             c.font=DATA_FONT; c.border=BORDER
+            c.fill = PatternFill('solid', start_color=pale, end_color=pale)
             if flag: c.fill = FLAG_FILL
 
     ws.column_dimensions['A'].width = 10
     ws.column_dimensions['B'].width = 30
     ws.column_dimensions['C'].width = 12
     ws.freeze_panes = f'A{hdr_row+1}'
+
+    # オートフィルター（見出し行〜最終回答行、全列に設定）
+    last_col = CODE_START + len(codes) - 1 if codes else FIXED_N
+    ws.auto_filter.ref = f'A{hdr_row}:{get_column_letter(last_col)}{hdr_row + len(results)}'
 
     # ══════════════════════════════════════════════════
     # 集計ダイジェストシート
@@ -831,8 +918,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
              value=f'集計日時: {datetime.now().strftime("%Y/%m/%d %H:%M")}  有効回答数: {total}件').font = Font(
         name='Meiryo UI', size=10, color='808080')
 
-    # センチメント集計
-    ws2.cell(row=4, column=1, value='■ センチメント集計').font = SUB_FONT
+    # 特記情報集計
+    ws2.cell(row=4, column=1, value='■ 特記情報集計').font = SUB_FONT
     sent_order2 = [('positive','ポジティブ'),('negative','ネガティブ'),('neutral','ニュートラル')]
     for i, (sent, label) in enumerate(sent_order2):
         cnt = sent_counts[sent]
@@ -857,21 +944,41 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     c4 = ws2.cell(row=6, column=2+len(sent_order2)*2, value=round(un_pct,1))
     c4.font=DATA_FONT; c4.border=BORDER
 
+    # リスクチェック（有効化された項目のみ）
+    risk_base_col2 = 1 + (len(sent_order2)+1)*2
+    for i, o in enumerate(risk_opts):
+        cnt = risk_counts.get(o['key'], 0)
+        pct = cnt / total * 100 if total > 0 else 0
+        col = risk_base_col2 + i*2
+        c = ws2.cell(row=5, column=col, value=o['label'])
+        c.font=HDR_FONT; c.fill=HDR_FILL; c.border=BORDER
+        c2 = ws2.cell(row=5, column=col+1, value=cnt)
+        c2.font=DATA_FONT; c2.border=BORDER
+        c3 = ws2.cell(row=6, column=col, value='%')
+        c3.font=HDR_FONT; c3.fill=HDR_FILL; c3.border=BORDER
+        c4 = ws2.cell(row=6, column=col+1, value=round(pct,1))
+        c4.font=DATA_FONT; c4.border=BORDER
+
     # GT集計（行方向・出現率順）
     ws2.cell(row=8, column=1, value='■ コード別GT集計').font = SUB_FONT
-    gt_headers = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '出現件数', '出現率(%)', '定義']
+    gt_headers = ['カテゴリID', 'カテゴリ名', 'コードID', 'コード名', '出現件数', '出現率(%)', '定義', 'キーワード']
     for ci, h in enumerate(gt_headers):
         c = ws2.cell(row=9, column=ci+1, value=h)
         c.font=HDR_FONT; c.fill=HDR_FILL; c.border=BORDER
+
+    code_kw_map = {}
+    for cd in codes:
+        kw = cd.get('keywords', [])
+        if isinstance(kw, list):
+            kw = '; '.join(kw)
+        code_kw_map[cd['code_id']] = kw or ''
 
     # 出現率順にソート
     gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
     for ri, row_data in enumerate(gt_sorted):
         r    = 10 + ri
         pct  = row_data['pct']
-        fill = PatternFill('solid',
-                           start_color=cat_color.get(row_data['cat_id'], 'FFFFFF'),
-                           end_color=cat_color.get(row_data['cat_id'], 'FFFFFF'))
+        pale = cat_color_pale.get(row_data['cat_id'], 'FFFFFF')
         vals = [
             row_data['cat_id'],
             row_data['cat_name'],
@@ -880,11 +987,12 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             row_data['count'],
             pct,
             row_data['definition'],
+            code_kw_map.get(row_data['code_id'], ''),
         ]
         for ci, val in enumerate(vals):
             c = ws2.cell(row=r, column=ci+1, value=val)
             c.font=DATA_FONT; c.border=BORDER
-            c.fill = fill
+            c.fill = PatternFill('solid', start_color=pale, end_color=pale)
             if ci == 5:  # 出現率列
                 if pct >= 20:
                     c.fill = HIGH_FILL
@@ -893,9 +1001,31 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
                     c.font = Font(name='Meiryo UI', size=10, color='FF0000', bold=True)
 
     # 列幅
-    for ci, w in enumerate([10, 22, 10, 24, 10, 10, 40]):
+    for ci, w in enumerate([10, 22, 10, 24, 10, 10, 40, 30]):
         ws2.column_dimensions[get_column_letter(ci+1)].width = w
     ws2.freeze_panes = 'A10'
+
+    # 棒グラフ（画面の「コード別GT集計」と同じ配色。データポイントごとに色を指定）
+    if gt_sorted:
+        chart_row_start = 10
+        chart_row_end   = 10 + len(gt_sorted) - 1
+        chart = BarChart()
+        chart.type  = 'col'
+        chart.title = 'コード別出現率(%)'
+        chart.y_axis.title = '出現率(%)'
+        data = Reference(ws2, min_col=6, min_row=9, max_row=chart_row_end)
+        cats = Reference(ws2, min_col=4, min_row=chart_row_start, max_row=chart_row_end)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        series = chart.series[0]
+        series.data_points = [
+            DataPoint(idx=i, spPr=GraphicalProperties(
+                solidFill=cat_color_full.get(row_data['cat_id'], 'FFFFFF')))
+            for i, row_data in enumerate(gt_sorted)
+        ]
+        chart.width  = 24
+        chart.height = 10
+        ws2.add_chart(chart, f'A{chart_row_end + 3}')
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1180,7 +1310,7 @@ CODING_SCOPE_SIZES   = {
 
 
 def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90,
-                 coding_model=CODING_MODEL):
+                 coding_model=CODING_MODEL, enabled_risks=None):
     """itemsをコーディングし、結果リストを返す（集計は行わない）"""
     if not items:
         return []
@@ -1188,7 +1318,7 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
     results = []
     batches = [items[i:i+BATCH] for i in range(0, len(items), BATCH)]
     for bi, batch in enumerate(batches):
-        res = llm_code_batch(client, batch, codes, q_name, model=coding_model)
+        res = llm_code_batch(client, batch, codes, q_name, model=coding_model, enabled_risks=enabled_risks)
         results.extend(res)
         pct = p_start + (p_end - p_start) * ((bi+1) / len(batches))
         progress_bar.progress(min(pct, p_end))
@@ -1198,13 +1328,15 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
 
 
 def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
-                  codebook_mode='A', existing_codebook=None, sample_size=None, coding_model=CODING_MODEL):
+                  codebook_mode='A', existing_codebook=None, sample_size=None, coding_model=CODING_MODEL,
+                  enabled_risks=None):
     """
     コードブック策定（または既存コードブックの読み込み）を行い、指定件数だけコーディング・集計する。
     sample_size=0: コーディングしない（策定のみ）／ None: 全件 ／ それ以外: min(sample_size, 全件数)件
-    coding_modelはこの分析（result）に紐づけて保存し、続きをコーディングする際も同じモデルを使う
-    （分析の途中でモデルが混在しないようにするため。精度・価格比較は分析単位で行う想定）。
+    coding_model・enabled_risksはこの分析（result）に紐づけて保存し、続きをコーディングする際も
+    同じ設定を使う（分析の途中でモデルやリスクチェック対象が混在しないようにするため）。
     """
+    enabled_risks = enabled_risks or []
     reset_token_usage()
     client = make_client('Anthropic', api_key)
     all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
@@ -1234,33 +1366,36 @@ def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     n = total_items if sample_size is None else min(sample_size, total_items)
 
     results = _code_items(client, q_name, codes, all_items[:n], progress_bar, status_text,
-                           coding_model=coding_model)
+                           coding_model=coding_model, enabled_risks=enabled_risks)
 
     status_text.markdown('**集計中...**')
-    gt, sent_counts, unassigned = aggregate_results(codes, results, n)
+    gt, sent_counts, unassigned, risk_counts = aggregate_results(codes, results, n, risk_keys=enabled_risks)
     progress_bar.progress(1.0)
     status_text.markdown('**✅ 完了！**')
 
     usage = get_token_usage()
     return {
-        'codebook':     codebook,
-        'codes':        codes,
-        'items':        all_items,
-        'results':      results,
-        'coded_count':  n,
-        'total_items':  total_items,
-        'gt':           gt,
-        'sent':         sent_counts,
-        'unassigned':   unassigned,
-        'q_name':       q_name,
-        'usage':        usage,
-        'coding_model': coding_model,
+        'codebook':      codebook,
+        'codes':         codes,
+        'items':         all_items,
+        'results':       results,
+        'coded_count':   n,
+        'total_items':   total_items,
+        'gt':            gt,
+        'sent':          sent_counts,
+        'unassigned':    unassigned,
+        'risk_counts':   risk_counts,
+        'enabled_risks': enabled_risks,
+        'q_name':        q_name,
+        'usage':         usage,
+        'coding_model':  coding_model,
     }
 
 
 def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, progress_bar, status_text,
-                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL):
+                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL, enabled_risks=None):
     """既存のコーディング結果に続けて、未コーディング分から追加でadd_size件をコーディングする"""
+    enabled_risks = enabled_risks or []
     reset_token_usage()
     client = make_client('Anthropic', api_key)
 
@@ -1269,11 +1404,11 @@ def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, pr
     new_items   = all_items[coded_count:new_count]
 
     new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90,
-                               coding_model=coding_model)
+                               coding_model=coding_model, enabled_risks=enabled_risks)
 
     status_text.markdown('**集計中...**')
     results = (prior_results or []) + new_results
-    gt, sent_counts, unassigned = aggregate_results(codes, results, new_count)
+    gt, sent_counts, unassigned, risk_counts = aggregate_results(codes, results, new_count, risk_keys=enabled_risks)
     progress_bar.progress(1.0)
     status_text.markdown('**✅ 完了！**')
 
@@ -1293,6 +1428,7 @@ def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, pr
         'gt':          gt,
         'sent':        sent_counts,
         'unassigned':  unassigned,
+        'risk_counts': risk_counts,
         'usage':       usage,
     }
 # ══════════════════════════════════════════════════
@@ -1333,7 +1469,7 @@ with st.sidebar:
     )
 
     st.markdown('**📐 コードブック策定方式**')
-    codebook_mode_label = st.radio(
+    codebook_mode_label = st.selectbox(
         'コードブック策定方式',
         CODEBOOK_MODE_LABELS,
         index=1,
@@ -1370,7 +1506,7 @@ with st.sidebar:
         st.caption('※ 既存のコードブックを使用する場合、「コード数の上限」は適用されません')
 
     st.markdown('**🧮 コーディング範囲**')
-    coding_scope_label = st.radio(
+    coding_scope_label = st.selectbox(
         'コーディング範囲',
         CODING_SCOPE_OPTIONS,
         index=1,
@@ -1390,6 +1526,12 @@ with st.sidebar:
              '「📜 作業履歴」で結果とコストを見比べてください（1回の分析中でモデルが混在することはありません）。'
     )
     coding_model = CODING_MODEL_OPTIONS[coding_model_label]
+
+    st.markdown('**⚠️ リスクチェック（該当有無を検知）**')
+    enabled_risks = []
+    for opt in RISK_CHECK_OPTIONS:
+        if st.checkbox(opt['label'], help=opt['hint'], key=f"risk_{opt['key']}"):
+            enabled_risks.append(opt['key'])
 
     st.divider()
     st.markdown('**📖 使い方**')
@@ -1479,6 +1621,8 @@ with col2:
         st.markdown(f'**コード上限：** {max_codes}個')
         st.markdown(f'**策定方式：** {codebook_mode_label}')
         st.markdown(f'**コーディングモデル：** {coding_model_label}')
+        risk_labels = [o['label'] for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
+        st.markdown(f'**リスクチェック：** {"、".join(risk_labels) if risk_labels else "なし"}')
         st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
         est_min = max(3, len(texts) // 100 * 2)
         st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
@@ -1500,7 +1644,7 @@ if st.button(button_label, type='primary', width='stretch',
         result = run_pipeline(
             api_key, q_name, texts, max_codes,
             progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
-            coding_sample_size, coding_model
+            coding_sample_size, coding_model, enabled_risks
         )
 
     if result:
@@ -1669,6 +1813,7 @@ if active_result:
                         coded_count, remaining, progress_bar2, status_text2,
                         prior_results=result.get('results', []), prior_usage=result.get('usage'),
                         coding_model=result.get('coding_model', CODING_MODEL),
+                        enabled_risks=result.get('enabled_risks', []),
                     )
                 result.update(continued)
                 for h in st.session_state.history:
@@ -1686,6 +1831,7 @@ if active_result:
                         0, total_items, progress_bar3, status_text3,
                         prior_results=None, prior_usage=result.get('usage'),
                         coding_model=result.get('coding_model', CODING_MODEL),
+                        enabled_risks=result.get('enabled_risks', []),
                     )
                 result.update(recoded)
                 for h in st.session_state.history:
@@ -1700,18 +1846,27 @@ if active_result:
     if coded_count > 0:
         st.subheader('📊 コーディング結果')
 
-        st.markdown('#### 😊 センチメント集計')
-        sent       = result['sent']
-        unassigned = result.get('unassigned', 0)
+        sent         = result['sent']
+        unassigned   = result.get('unassigned', 0)
+        risk_counts  = result.get('risk_counts', {})
+        result_risks = result.get('enabled_risks', [])
         def _pct(cnt):
             return f'{cnt/coded_count*100:.1f}%' if coded_count else '0.0%'
-        st.markdown(f"""
+
+        risk_icons = {'claim': '📣', 'personal': '🪪', 'address': '📍', 'org': '🏢', 'danger': '🚨'}
+        risk_html = ''.join(
+            f"  <div>{risk_icons.get(o['key'], '⚠️')} <b>{o['label']}</b>　"
+            f"{risk_counts.get(o['key'], 0)}件（{_pct(risk_counts.get(o['key'], 0))}）</div>\n"
+            for o in RISK_CHECK_OPTIONS if o['key'] in result_risks
+        )
+        with st.expander('📌 特記情報', expanded=True):
+            st.markdown(f"""
 <div style="display:flex; flex-wrap:nowrap; overflow-x:auto; gap:32px; padding:4px 0;">
   <div>😊 <b>ポジティブ</b>　{sent['positive']}件（{_pct(sent['positive'])}）</div>
   <div>😞 <b>ネガティブ</b>　{sent['negative']}件（{_pct(sent['negative'])}）</div>
   <div>😐 <b>ニュートラル</b>　{sent['neutral']}件（{_pct(sent['neutral'])}）</div>
   <div>➖ <b>非該当（コードなし）</b>　{unassigned}件（{_pct(unassigned)}）</div>
-</div>
+{risk_html}</div>
 """, unsafe_allow_html=True)
 
         st.divider()
@@ -1778,7 +1933,8 @@ if active_result:
         st.markdown(f'#### 💾 レポートのダウンロード{partial_note}')
         excel_bytes = create_excel(
             q_name, gt, sent, coded_count,
-            result['results'], result['items'][:coded_count], result['codes'], unassigned
+            result['results'], result['items'][:coded_count], result['codes'], unassigned,
+            risk_counts=result.get('risk_counts', {}), enabled_risks=result.get('enabled_risks', []),
         )
         st.download_button(
             label='📥 Excelレポートをダウンロード',
