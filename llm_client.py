@@ -9,16 +9,19 @@ import re
 import time
 
 
-# グローバルトークンカウンター
-_token_usage = {'input': 0, 'output': 0}
+# グローバルトークンカウンター（キャッシュ読み込み/書き込み分と累積コストも保持）
+_token_usage = {'input': 0, 'output': 0, 'cache_read': 0, 'cache_creation': 0, 'cost_jpy': 0.0}
 
 def reset_token_usage():
     """トークンカウンターをリセット"""
-    _token_usage['input']  = 0
-    _token_usage['output'] = 0
+    _token_usage['input']          = 0
+    _token_usage['output']         = 0
+    _token_usage['cache_read']     = 0
+    _token_usage['cache_creation'] = 0
+    _token_usage['cost_jpy']       = 0.0
 
 def get_token_usage() -> dict:
-    """現在のトークン使用量を返す"""
+    """現在のトークン使用量（キャッシュ内訳・累積コスト込み）を返す"""
     return dict(_token_usage)
 
 
@@ -29,26 +32,36 @@ def get_last_error() -> str | None:
     """call_llmが直近でNoneを返した理由（例外メッセージ）を返す"""
     return _last_error
 
-def calc_cost_jpy(input_tokens: int, output_tokens: int, model: str) -> float:
+def calc_cost_jpy(input_tokens: int, output_tokens: int, model: str,
+                   cache_read_tokens: int = 0, cache_creation_tokens: int = 0) -> float:
     """
-    概算コストを円で返す（1USD=150円換算）
+    概算コストを円で返す（1USD=150円換算）。
+    キャッシュ読み込みは通常入力の約0.1倍、キャッシュ書き込み（5分TTL）は約1.25倍で計算する。
     claude-sonnet-4-6: input $3/1M, output $15/1M
+    claude-haiku-4-5:  input $1/1M, output $5/1M
     """
     rate = 150  # USD→JPY
-    if 'sonnet' in model:
-        cost = (input_tokens / 1_000_000 * 3 + output_tokens / 1_000_000 * 15) * rate
-    elif 'haiku' in model:
-        cost = (input_tokens / 1_000_000 * 0.25 + output_tokens / 1_000_000 * 1.25) * rate
+    if 'haiku' in model:
+        in_price, out_price = 1.00, 5.00
     else:
-        cost = (input_tokens / 1_000_000 * 3 + output_tokens / 1_000_000 * 15) * rate
-    return round(cost, 1)
+        in_price, out_price = 3.00, 15.00
+    cost_usd = (
+        input_tokens          / 1_000_000 * in_price
+        + cache_read_tokens     / 1_000_000 * in_price * 0.1
+        + cache_creation_tokens / 1_000_000 * in_price * 1.25
+        + output_tokens         / 1_000_000 * out_price
+    )
+    return round(cost_usd * rate, 1)
 
 
-def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> dict | list | None:
+def call_llm(client, prompt: str, schema: dict, provider: str, model: str,
+             system: str | None = None, cache_system: bool = False) -> dict | list | None:
     """
     構造化出力でLLMを呼び出す。
     tool_use / function_calling → 失敗時はJSONフォールバックの順で試みる。
-    トークン使用量をグローバルカウンターに累積する。
+    トークン使用量・概算コストをグローバルカウンターに累積する。
+    system/cache_systemは、複数回のバッチ呼び出しで変わらない部分（コードブックなど）を
+    system側に分離しプロンプトキャッシュ（cache_control）を効かせたい場合に使う。
     """
     global _last_error
     last_reason = None
@@ -62,15 +75,21 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
         try:
             temperature = temperatures[attempt]
             if provider == 'Anthropic':
-                result, usage = _call_anthropic(client, prompt, schema, model, temperature)
+                result, usage = _call_anthropic(client, prompt, schema, model, temperature, system, cache_system)
             elif provider == 'OpenAI':
-                result, usage = _call_openai(client, prompt, schema, model, temperature)
+                result, usage = _call_openai(client, prompt, schema, model, temperature, system)
             else:
                 raise ValueError(f'未対応のプロバイダ: {provider}')
 
             if usage:
-                _token_usage['input']  += usage.get('input', 0)
-                _token_usage['output'] += usage.get('output', 0)
+                _token_usage['input']          += usage.get('input', 0)
+                _token_usage['output']         += usage.get('output', 0)
+                _token_usage['cache_read']      += usage.get('cache_read', 0)
+                _token_usage['cache_creation']  += usage.get('cache_creation', 0)
+                _token_usage['cost_jpy']        += calc_cost_jpy(
+                    usage.get('input', 0), usage.get('output', 0), model,
+                    usage.get('cache_read', 0), usage.get('cache_creation', 0),
+                )
 
             if result:
                 _last_error = None
@@ -91,24 +110,38 @@ def call_llm(client, prompt: str, schema: dict, provider: str, model: str) -> di
     return None
 
 
-def _call_anthropic(client, prompt: str, schema: dict, model: str, temperature: float = 0) -> tuple:
-    """Anthropic tool_use を使った構造化呼び出し"""
+def _call_anthropic(client, prompt: str, schema: dict, model: str, temperature: float = 0,
+                     system: str | None = None, cache_system: bool = False) -> tuple:
+    """
+    Anthropic tool_use を使った構造化呼び出し。
+    system指定時はsystemパラメータとして渡す。cache_system=Trueの場合、
+    system全体にcache_control（プロンプトキャッシュ）を付与する
+    （同じsystem文字列を使い回すバッチ処理で、2回目以降のコストを大幅に削減できる）。
+    """
     tool = {
         'name': 'output_result',
         'description': 'プロンプトの指示に従って結果を構造化して返す',
         'input_schema': schema,
     }
-    response = client.messages.create(
+    kwargs = dict(
         model=model,
         max_tokens=8192,
         temperature=temperature,
         tools=[tool],
         tool_choice={'type': 'tool', 'name': 'output_result'},
-        messages=[{'role': 'user', 'content': prompt}]
+        messages=[{'role': 'user', 'content': prompt}],
     )
+    if system:
+        if cache_system:
+            kwargs['system'] = [{'type': 'text', 'text': system, 'cache_control': {'type': 'ephemeral'}}]
+        else:
+            kwargs['system'] = system
+    response = client.messages.create(**kwargs)
     usage = {
-        'input':  response.usage.input_tokens,
-        'output': response.usage.output_tokens,
+        'input':          response.usage.input_tokens,
+        'output':         response.usage.output_tokens,
+        'cache_read':     getattr(response.usage, 'cache_read_input_tokens', 0) or 0,
+        'cache_creation': getattr(response.usage, 'cache_creation_input_tokens', 0) or 0,
     }
     if response.stop_reason == 'max_tokens':
         raise RuntimeError(
@@ -141,8 +174,13 @@ def _call_anthropic(client, prompt: str, schema: dict, model: str, temperature: 
     )
 
 
-def _call_openai(client, prompt: str, schema: dict, model: str, temperature: float = 0) -> tuple:
-    """OpenAI function_calling を使った構造化呼び出し"""
+def _call_openai(client, prompt: str, schema: dict, model: str, temperature: float = 0,
+                  system: str | None = None) -> tuple:
+    """
+    OpenAI function_calling を使った構造化呼び出し。
+    OpenAI側はプロンプトキャッシュが自動適用されるため、cache_system相当の明示指定は不要。
+    system指定時はsystemロールのメッセージとして渡すのみ。
+    """
     tool = {
         'type': 'function',
         'function': {
@@ -151,13 +189,17 @@ def _call_openai(client, prompt: str, schema: dict, model: str, temperature: flo
             'parameters': schema,
         }
     }
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': prompt})
     response = client.chat.completions.create(
         model=model,
         max_tokens=8192,
         temperature=temperature,
         tools=[tool],
         tool_choice={'type': 'function', 'function': {'name': 'output_result'}},
-        messages=[{'role': 'user', 'content': prompt}]
+        messages=messages
     )
     usage = {
         'input':  response.usage.prompt_tokens,

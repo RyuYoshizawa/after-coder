@@ -16,9 +16,14 @@ from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
-from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, calc_cost_jpy, get_last_error
+from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, get_last_error
 
 APP_DIR = Path(__file__).parent
+
+# コードブック策定・編集は判断の質が重要なためSonnet、
+# コーディング（既存コードブックへの分類作業）は定型的なためHaikuを使い、コストを抑える。
+CODEBOOK_MODEL = 'claude-sonnet-4-6'
+CODING_MODEL   = 'claude-haiku-4-5'
 
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
@@ -136,7 +141,7 @@ def llm_generate_codebook(client, items, max_codes, q_name, data_context=''):
         },
         'required': ['categories'],
     }
-    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
 
 
 def llm_generate_codebook_topdown(client, data_context, q_name, max_codes):
@@ -171,7 +176,7 @@ def llm_generate_codebook_topdown(client, data_context, q_name, max_codes):
         },
         'required': ['categories'],
     }
-    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
 
 
 def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, data_context=''):
@@ -228,7 +233,7 @@ def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, da
         },
         'required': ['categories'],
     }
-    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
 
 
 def llm_extract_topics(client, items, q_name, data_context=''):
@@ -252,7 +257,7 @@ def llm_extract_topics(client, items, q_name, data_context=''):
         },
         'required': ['topics'],
     }
-    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    result = call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
     if result and isinstance(result, dict):
         return result.get('topics', [])
     return []
@@ -279,7 +284,7 @@ def llm_reduce_topics(client, topics, q_name, data_context=''):
         },
         'required': ['topics'],
     }
-    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    result = call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
     if result and isinstance(result, dict):
         return result.get('topics', [])
     return topics  # 失敗時は元のチャンクをそのまま返し情報を失わない
@@ -332,7 +337,7 @@ def llm_consolidate_topics(client, topics, max_codes, q_name, data_context=''):
         },
         'required': ['categories'],
     }
-    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
 
 
 def llm_detect_new_codes(client, items, codebook, max_codes, q_name):
@@ -381,19 +386,24 @@ code_idは既存コードと同じC0101形式で採番すること（接頭辞�
         },
         'required': ['new_codes'],
     }
-    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    result = call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
     if result is None:
         return []
     return result.get('new_codes', [])
 
 
 def llm_code_batch(client, items, codes, q_name):
+    """
+    コーディング本体。同じコードブック（system側）を1回のコーディング実行中に何十回も
+    使い回すため、コードブック・ルールをsystemに分離しcache_control（プロンプトキャッシュ）を
+    効かせ、2回目以降のバッチでコードブック分のコストを大幅に削減する。
+    分類作業でありコードブック生成ほどの判断力を要さないため、モデルもHaiku（CODING_MODEL）を使う。
+    """
     code_list = '\n'.join(
         f'{c["code_id"]}（{c["cat_name"]}）: {c["code_name"]} / {c["definition"][:25]}'
         for c in codes
     )
-    items_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
-    prompt = f"""「{q_name}」の回答にコードブックに基づいてコーディングしてください。
+    system_prompt = f"""「{q_name}」の回答にコードブックに基づいてコーディングしてください。
 
 【コードブック】
 {code_list}
@@ -401,9 +411,10 @@ def llm_code_batch(client, items, codes, q_name):
 【ルール】
 - 1回答に複数コード付与可
 - 該当なしはcodesを空配列
-- sentimentは positive/negative/neutral
+- sentimentは positive/negative/neutral"""
 
-【回答】
+    items_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
+    prompt = f"""【回答】
 {items_text}"""
 
     schema = {
@@ -424,7 +435,8 @@ def llm_code_batch(client, items, codes, q_name):
         },
         'required': ['results'],
     }
-    result = call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    result = call_llm(client, prompt, schema, 'Anthropic', CODING_MODEL,
+                       system=system_prompt, cache_system=True)
     if result and isinstance(result, dict):
         return result.get('results', [])
     return []
@@ -481,7 +493,7 @@ def llm_edit_codebook(client, codebook, instruction, q_name):
         },
         'required': ['categories'],
     }
-    return call_llm(client, prompt, schema, 'Anthropic', 'claude-sonnet-4-6')
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
 # ══════════════════════════════════════════════════
 # 集計・Excel出力関数
 # ══════════════════════════════════════════════════
@@ -1175,8 +1187,11 @@ def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, pr
     usage = get_token_usage()
     if prior_usage:
         usage = {
-            'input':  usage.get('input', 0)  + prior_usage.get('input', 0),
-            'output': usage.get('output', 0) + prior_usage.get('output', 0),
+            'input':          usage.get('input', 0)          + prior_usage.get('input', 0),
+            'output':         usage.get('output', 0)         + prior_usage.get('output', 0),
+            'cache_read':     usage.get('cache_read', 0)     + prior_usage.get('cache_read', 0),
+            'cache_creation': usage.get('cache_creation', 0) + prior_usage.get('cache_creation', 0),
+            'cost_jpy':       usage.get('cost_jpy', 0)       + prior_usage.get('cost_jpy', 0),
         }
 
     return {
@@ -1418,17 +1433,27 @@ if active_result:
     else:
         st.success('✅ 分析が完了しました！')
 
-    # コスト表示（共通）
-    usage = result.get('usage', {})
-    inp   = usage.get('input', 0)
-    out   = usage.get('output', 0)
-    cost  = calc_cost_jpy(inp, out, 'claude-sonnet-4-6')
+    # コスト表示（共通。プロンプトキャッシュの読み込み/書き込み分は呼び出し時点のモデル単価で
+    # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）
+    usage      = result.get('usage', {})
+    inp        = usage.get('input', 0)
+    out        = usage.get('output', 0)
+    cache_read = usage.get('cache_read', 0)
+    cache_new  = usage.get('cache_creation', 0)
+    cost       = usage.get('cost_jpy', 0.0)
     with st.expander('💰 API使用コスト（参考）'):
         c1, c2, c3 = st.columns(3)
         c1.metric('入力トークン', f'{inp:,}')
         c2.metric('出力トークン', f'{out:,}')
         c3.metric('推定コスト', f'約 ¥{cost:.0f}')
-        st.caption('※ 1USD=150円換算。claude-sonnet-4-6の料金に基づく概算です。')
+        if cache_read or cache_new:
+            c4, c5 = st.columns(2)
+            c4.metric('キャッシュ読込（約1/10単価）', f'{cache_read:,}')
+            c5.metric('キャッシュ書込（約1.25倍単価）', f'{cache_new:,}')
+        st.caption(
+            '※ 1USD=150円換算。コードブック策定はSonnet、コーディングはHaikuの料金に基づく概算です。'
+            'コーディングはコードブックをプロンプトキャッシュしており、2回目以降のバッチはキャッシュ読込分が割安になります。'
+        )
 
     # ── コードブック（構造のみ。折りたたまず常時表示、編集直後もその場で最新反映） ──
     st.markdown('#### 📐 コードブック')
