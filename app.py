@@ -982,14 +982,88 @@ def _topics_cache_key(all_items, q_name, data_context):
     return hashlib.sha256(src.encode('utf-8')).hexdigest()
 
 
-def _build_codebook_c_stage1(client, stage1_items, max_codes, q_name, data_context, progress_bar, status_text):
-    """方式C Stage1：ランダム抽出した一部から主題抽出→統合し初期コードブックを作る"""
-    batches    = [stage1_items[i:i+50] for i in range(0, len(stage1_items), 50)]
-    topics_all = []
-    for bi, batch in enumerate(batches):
+# Stage1主題抽出の進捗をディスクに保存するディレクトリ。
+# st.session_stateはアプリ再起動・セッション切断で消えてしまうため、
+# 大量データ（全件精査など）でバッチ数が多い場合に途中経過を失わないよう、
+# ディスクにも進捗を残し、次回同じデータで実行した際に未処理バッチから再開できるようにする。
+STAGE1_CACHE_DIR = APP_DIR / '.codebook_cache'
+
+
+def _stage1_cache_path(cache_key):
+    # cache_keyには「:」（ratioの区切り）が含まれ、Windowsのファイル名では
+    # 特殊な意味を持つ（NTFSの代替データストリームとして扱われ、ファイルが
+    # 実質空になる）ため、ファイル名にはcache_key自体ではなく再ハッシュした値を使う。
+    safe_name = hashlib.sha256(cache_key.encode('utf-8')).hexdigest()
+    return STAGE1_CACHE_DIR / f'{safe_name}.json'
+
+
+def _load_stage1_checkpoint(cache_key):
+    path = _stage1_cache_path(cache_key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_stage1_checkpoint(cache_key, data):
+    STAGE1_CACHE_DIR.mkdir(exist_ok=True)
+    _stage1_cache_path(cache_key).write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+
+def _clear_stage1_checkpoint(cache_key):
+    path = _stage1_cache_path(cache_key)
+    if path.exists():
+        path.unlink()
+
+
+def _cleanup_old_stage1_checkpoints(max_age_hours=24):
+    """古い（放棄された）チェックポイントファイルを掃除する。実行のたびに軽く呼ぶだけの簡易処理。"""
+    if not STAGE1_CACHE_DIR.exists():
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    for f in STAGE1_CACHE_DIR.glob('*.json'):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _build_codebook_c_stage1(client, stage1_items, max_codes, q_name, data_context, progress_bar, status_text,
+                              cache_key):
+    """
+    方式C Stage1：ランダム抽出した一部から主題抽出→統合し初期コードブックを作る。
+    大量データ（全件精査など）では主題抽出のバッチ数が多く1回の実行時間が長くなるため、
+    バッチ完了ごとに進捗をディスクへ保存する。アプリの再起動やセッション切断で処理が
+    中断しても、同じデータで再実行すれば未処理バッチから再開でき、最初からやり直しにならない。
+    """
+    _cleanup_old_stage1_checkpoints()
+    batches = [stage1_items[i:i+50] for i in range(0, len(stage1_items), 50)]
+
+    checkpoint = _load_stage1_checkpoint(cache_key)
+    if checkpoint and checkpoint.get('total_batches') == len(batches):
+        topics_all         = checkpoint.get('topics_all', [])
+        completed_batches  = checkpoint.get('completed_batches', 0)
+    else:
+        topics_all        = []
+        completed_batches = 0
+
+    if completed_batches > 0:
+        status_text.markdown(
+            f'**Step 1/3** Stage1: 前回の続きから再開します（{completed_batches}/{len(batches)}バッチ済み）...'
+        )
+
+    for bi in range(completed_batches, len(batches)):
         status_text.markdown(f'**Step 1/3** Stage1（{len(stage1_items)}件）: 主題抽出中... {bi+1}/{len(batches)}バッチ')
-        topics_all.extend(llm_extract_topics(client, batch, q_name, data_context))
+        topics_all.extend(llm_extract_topics(client, batches[bi], q_name, data_context))
         progress_bar.progress(min(0.05 + 0.08 * ((bi+1) / len(batches)), 0.13))
+        _save_stage1_checkpoint(cache_key, {
+            'total_batches':     len(batches),
+            'completed_batches': bi + 1,
+            'topics_all':        topics_all,
+        })
 
     topics_dedup = list(dict.fromkeys(topics_all))
 
@@ -1015,6 +1089,10 @@ def _build_codebook_c_stage1(client, stage1_items, max_codes, q_name, data_conte
     )
     codebook = llm_consolidate_topics(client, topics_dedup, max_codes, q_name, data_context)
     progress_bar.progress(0.15)
+    if codebook:
+        # 成功した場合のみチェックポイントを消す。失敗時は残しておき、
+        # 再実行時に抽出済みの主題リストから（再抽出せず）統合からやり直せるようにする。
+        _clear_stage1_checkpoint(cache_key)
     return codebook
 
 
@@ -1023,8 +1101,11 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
     方式C1/C2/C3共通処理：全件精査
     Stage1: 全体のratio割合をランダム抽出して主題抽出→統合し初期コードブックを作成
     Stage2: 残り（1-ratio）を差分検出（ratio=1.0の場合は残りがないため実施しない）
-    途中のステージまでの結果はセッション内でキャッシュし、後段の失敗時に前段からの
+    ステージ完了ごとの結果はセッション内でキャッシュし、後段の失敗時に前段からの
     やり直しを避ける（同一データ・設問名・分析データの特徴・ratioの場合のみ再利用）。
+    さらにStage1内部（主題抽出）はバッチごとにディスクへも進捗を保存しており、
+    大量データでStage1の途中にアプリが再起動・セッション切断しても再開できる（詳細は
+    `_build_codebook_c_stage1`参照）。
     """
     cache_key   = _topics_cache_key(all_items, q_name, data_context) + f':{ratio}'
     stage_cache = st.session_state.setdefault('stage_codebook_cache', {})
@@ -1040,7 +1121,7 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
         progress_bar.progress(0.15 if remaining else 0.30)
     else:
         codebook = _build_codebook_c_stage1(
-            client, all_items[:n1], max_codes, q_name, data_context, progress_bar, status_text
+            client, all_items[:n1], max_codes, q_name, data_context, progress_bar, status_text, cache_key
         )
         if not codebook:
             return None
