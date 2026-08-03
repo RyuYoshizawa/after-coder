@@ -43,6 +43,26 @@ RISK_CHECK_OPTIONS = [
     {'key': 'danger',    'label': '危険情報',   'char': '危', 'hint': '犯罪予告、自死予告、強い恨み'},
 ]
 
+# 画面の縦棒グラフ（コード別GT集計）とExcelレポートで完全に同じ色をカテゴリごとに使うための
+# 固定配色。st.plotly_chart()は既定でStreamlit自身のテーマ配色を自動適用するが、その並び順は
+# ブラウザ／OSのライト・ダーク設定によって変わってしまう（同じデータでも色が入れ替わる）ため、
+# ここで固定のcolor_discrete_mapとして明示的に指定し、画面表示・Excel・テーマ設定・再実行の
+# あいだで常に同じ色になるようにする。
+CHART_COLORS = ['0068C9', '83C9FF', 'FF2B2B', 'FFABAB', '29B09D',
+                 '7DEFA1', 'FF8700', 'FFD16A', '6D3FC0', 'D5DAE5']
+
+
+def _category_color_map(gt, codes):
+    """カテゴリの出現件数合計が多い順に、CHART_COLORSを先頭から割り当てる。"""
+    cat_total = {}
+    for g in gt:
+        cat_total[g['cat_id']] = cat_total.get(g['cat_id'], 0) + g['count']
+    for c in codes:
+        cat_total.setdefault(c['cat_id'], 0)
+    cat_order = sorted(cat_total, key=lambda cid: -cat_total[cid])
+    cat_color_full = {cid: CHART_COLORS[i % len(CHART_COLORS)] for i, cid in enumerate(cat_order)}
+    return cat_order, cat_color_full
+
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
     page_icon='📊',
@@ -698,12 +718,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     LOW_FILL  = PatternFill('solid', start_color='FCE4D6', end_color='FCE4D6')
     FLAG_FILL = PatternFill('solid', start_color='BDD7EE', end_color='BDD7EE')
 
-    # カテゴリ別カラー：画面の縦棒グラフ（st.plotly_chartが既定で適用するStreamlitテーマの
-    # 配色。Plotly自体のデフォルト配色ではない点に注意）と同じ色を、カテゴリ出現率の多い順に
-    # 割り当てる。「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
-    CHART_COLORS = ['83C9FF','0068C9','FFABAB','FF2B2B','7DEFA1',
-                      '29B09D','FFD16A','FF8700','6D3FC0','D5DAE5']
-
+    # カテゴリ別カラー：画面の縦棒グラフ（5.4節）と同じ色を、カテゴリ出現率の多い順に割り当てる。
+    # 「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
     def _lighten_hex(hex_color, factor=0.65):
         """指定した割合(0〜1)だけ白に近づけた淡い色を返す"""
         r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
@@ -712,13 +728,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         b = round(b + (255 - b) * factor)
         return f'{r:02X}{g:02X}{b:02X}'
 
-    cat_total = {}
-    for g in gt:
-        cat_total[g['cat_id']] = cat_total.get(g['cat_id'], 0) + g['count']
-    for c in codes:
-        cat_total.setdefault(c['cat_id'], 0)
-    cat_order      = sorted(cat_total, key=lambda cid: -cat_total[cid])
-    cat_color_full = {cid: CHART_COLORS[i % len(CHART_COLORS)] for i, cid in enumerate(cat_order)}
+    cat_order, cat_color_full = _category_color_map(gt, codes)
     cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
     cat_name_map   = {c['cat_id']: c['cat_name'] for c in codes}
 
@@ -1015,7 +1025,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     # 該当しない行は空欄にすることで、各コードの位置に実際には1本しか棒が出ないようにする
     # （chart.overlap=100と合わせて完全に重ねる）。可視の集計表（上記）とは順序が異なる
     # （こちらは「操作画面の順A＝カテゴリ出現率順→コード出現率順」に固定）。
-    gt_sorted_a = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
+    cat_rank    = {cid: i for i, cid in enumerate(cat_order)}
+    gt_sorted_a = sorted(gt, key=lambda x: (cat_rank.get(x['cat_id'], len(cat_order)), -x['count']))
 
     if gt_sorted_a:
         HELPER_START_COL = 10  # J列から（表示テーブルはA〜H列なので余裕を持たせる）
@@ -1951,12 +1962,16 @@ if active_result:
         import plotly.express as px
         df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
         df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
+        _cat_order, _cat_color_full = _category_color_map(gt, result['codebook'])
+        _cat_name_map = {c['cat_id']: c['cat_name'] for c in result['codebook']}
+        color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order}
         fig = px.bar(
             df_plot,
             x='コード名',
             y='出現率(%)',
             color='カテゴリ',
             category_orders={'コード名': df_plot['コード名'].tolist()},
+            color_discrete_map=color_discrete_map,
             labels={'出現率(%)': '出現率(%)', 'コード名': ''},
         )
         fig.update_layout(
