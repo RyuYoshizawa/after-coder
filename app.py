@@ -68,7 +68,7 @@ st.set_page_config(
     page_icon='📊',
     layout='wide'
 )
-st.logo(str(APP_DIR / 'mj.png'), size='large')
+st.logo(str(APP_DIR / 'after_coder_MARK.png'), size='large')
 
 # ── スタイル ──────────────────────────────────────────────────────
 st.markdown("""
@@ -1087,7 +1087,27 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             series.graphicalProperties = GraphicalProperties(solidFill=cat_color_full.get(cid, 'FFFFFF'))
         chart.width  = 26
         chart.height = 11
-        ws2.add_chart(chart, f'A{chart_row_end + 3}')
+        chart_anchor_row = chart_row_end + 3
+        ws2.add_chart(chart, f'A{chart_anchor_row}')
+
+        # ── グラフ下の集計表（グラフと同じ順＝順A：カテゴリ出現率順→コード出現率順） ──
+        # チャートの高さ(11cm)は既定の行高（約0.53cm/行）でおよそ21行分にあたるため、
+        # 重ならないよう十分な余白を空けて配置する。
+        TABLE_START = chart_anchor_row + 23
+        ws2.cell(row=TABLE_START, column=1, value='■ コード別集計表（グラフと同じ順）').font = SUB_FONT
+        table_hdr_row = TABLE_START + 1
+        row_labels = ['コード名', 'コード出現率(%)', 'コード出現数']
+        for i, label in enumerate(row_labels):
+            c = ws2.cell(row=table_hdr_row + i, column=1, value=label)
+            c.font = HDR_FONT; c.fill = HDR_FILL; c.border = BORDER
+        for ci, row_data in enumerate(gt_sorted_a):
+            col  = 2 + ci
+            full = cat_color_full.get(row_data['cat_id'], 'FFFFFF')
+            for ri, val in enumerate([row_data['code_name'], row_data['pct'], row_data['count']]):
+                c = ws2.cell(row=table_hdr_row + ri, column=col, value=val)
+                c.font = DATA_FONT; c.border = BORDER
+                c.fill = PatternFill('solid', start_color=full, end_color=full)
+            ws2.column_dimensions[get_column_letter(col)].width = 12
 
     buf = io.BytesIO()
     wb.save(buf)
