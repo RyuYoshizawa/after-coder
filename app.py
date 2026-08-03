@@ -1044,6 +1044,9 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         chart.gapWidth = 50
         chart.title = 'コード別出現率(%)（カテゴリ出現率順→コード出現率順）'
         chart.y_axis.title = '出現率(%)'
+        # データ元（J列以降）を非表示列にしているため、Excelの既定「表示セルのみプロット」設定
+        # (plotVisOnly=True)のままだと非表示列のデータが一切プロットされず、グラフが空になる。
+        chart.visible_cells_only = False
         cats = Reference(ws2, min_col=helper_label_col, min_row=chart_row_start, max_row=chart_row_end)
         for i, cid in enumerate(cat_order):
             col  = helper_label_col + 1 + i
