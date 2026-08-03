@@ -16,7 +16,6 @@ from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
-from openpyxl.chart.marker import DataPoint
 from openpyxl.chart.shapes import GraphicalProperties
 from datetime import datetime
 from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, get_last_error
@@ -719,6 +718,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     cat_order      = sorted(cat_total, key=lambda cid: -cat_total[cid])
     cat_color_full = {cid: PLOTLY_COLORS[i % len(PLOTLY_COLORS)] for i, cid in enumerate(cat_order)}
     cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
+    cat_name_map   = {c['cat_id']: c['cat_name'] for c in codes}
 
     def hdr(r, c, v):
         cell = ws.cell(row=r, column=c, value=v)
@@ -1005,26 +1005,56 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         ws2.column_dimensions[get_column_letter(ci+1)].width = w
     ws2.freeze_panes = 'A10'
 
-    # 棒グラフ（画面の「コード別GT集計」と同じ配色。データポイントごとに色を指定）
-    if gt_sorted:
-        chart_row_start = 10
-        chart_row_end   = 10 + len(gt_sorted) - 1
+    # ── 棒グラフ用の隠しヘルパー表 ──────────────────────────────
+    # Excelのネイティブな棒グラフには「1系列内で棒ごとに個別の色・凡例エントリを持たせる」機能が
+    # ないため（openpyxlのDataPoint個別着色は色は付くが凡例が棒の数だけ増えてしまい、
+    # カテゴリ単位の凡例にならない）、カテゴリごとに列を分けた表を裏で作り、
+    # カテゴリ数ぶんの系列（＝カテゴリごとに固定色・凡例1個）として描画する。
+    # 該当しない行は空欄にすることで、各コードの位置に実際には1本しか棒が出ないようにする
+    # （chart.overlap=100と合わせて完全に重ねる）。可視の集計表（上記）とは順序が異なる
+    # （こちらは「操作画面の順A＝カテゴリ出現率順→コード出現率順」に固定）。
+    gt_sorted_a = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
+
+    if gt_sorted_a:
+        HELPER_START_COL = 10  # J列から（表示テーブルはA〜H列なので余裕を持たせる）
+        helper_label_col = HELPER_START_COL
+        chart_hdr_row    = 9
+        chart_row_start  = 10
+        chart_row_end    = chart_row_start + len(gt_sorted_a) - 1
+
+        ws2.cell(row=chart_hdr_row, column=helper_label_col, value='コード名（グラフ用・カテゴリ順）')
+        for i, cid in enumerate(cat_order):
+            ws2.cell(row=chart_hdr_row, column=helper_label_col + 1 + i, value=cat_name_map.get(cid, cid))
+        for ri, row_data in enumerate(gt_sorted_a):
+            r = chart_row_start + ri
+            ws2.cell(row=r, column=helper_label_col, value=row_data['code_name'])
+            for i, cid in enumerate(cat_order):
+                col = helper_label_col + 1 + i
+                ws2.cell(row=r, column=col, value=row_data['pct'] if row_data['cat_id'] == cid else None)
+
+        helper_last_col = helper_label_col + len(cat_order)
+        for c in range(helper_label_col, helper_last_col + 1):
+            ws2.column_dimensions[get_column_letter(c)].hidden = True
+
+        # 棒グラフ（画面の「コード別GT集計」と同じ配色・同じ並び順＝カテゴリ出現率順→コード出現率順）
         chart = BarChart()
-        chart.type  = 'col'
-        chart.title = 'コード別出現率(%)'
+        chart.type     = 'col'
+        chart.grouping = 'clustered'
+        chart.overlap  = 100  # 系列を完全に重ね、コードごとに実質1本の棒に見せる
+        chart.gapWidth = 50
+        chart.title = 'コード別出現率(%)（カテゴリ出現率順→コード出現率順）'
         chart.y_axis.title = '出現率(%)'
-        data = Reference(ws2, min_col=6, min_row=9, max_row=chart_row_end)
-        cats = Reference(ws2, min_col=4, min_row=chart_row_start, max_row=chart_row_end)
-        chart.add_data(data, titles_from_data=True)
+        cats = Reference(ws2, min_col=helper_label_col, min_row=chart_row_start, max_row=chart_row_end)
+        for i, cid in enumerate(cat_order):
+            col  = helper_label_col + 1 + i
+            data = Reference(ws2, min_col=col, min_row=chart_hdr_row, max_row=chart_row_end)
+            chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        series = chart.series[0]
-        series.data_points = [
-            DataPoint(idx=i, spPr=GraphicalProperties(
-                solidFill=cat_color_full.get(row_data['cat_id'], 'FFFFFF')))
-            for i, row_data in enumerate(gt_sorted)
-        ]
-        chart.width  = 24
-        chart.height = 10
+        for i, series in enumerate(chart.series):
+            cid = cat_order[i]
+            series.graphicalProperties = GraphicalProperties(solidFill=cat_color_full.get(cid, 'FFFFFF'))
+        chart.width  = 26
+        chart.height = 11
         ws2.add_chart(chart, f'A{chart_row_end + 3}')
 
     buf = io.BytesIO()
