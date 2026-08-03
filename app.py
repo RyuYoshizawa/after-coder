@@ -1962,8 +1962,8 @@ if active_result:
         import plotly.express as px
         df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
         df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
-        _cat_order, _cat_color_full = _category_color_map(gt, result['codebook'])
-        _cat_name_map = {c['cat_id']: c['cat_name'] for c in result['codebook']}
+        _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
+        _cat_name_map = {c['cat_id']: c['cat_name'] for c in result['codes']}
         color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order}
         fig = px.bar(
             df_plot,
