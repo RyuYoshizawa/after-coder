@@ -17,6 +17,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.data_source import AxDataSource, StrRef
 from datetime import datetime
 from llm_client import call_llm, make_client, reset_token_usage, get_token_usage, get_last_error
 
@@ -697,10 +698,11 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     LOW_FILL  = PatternFill('solid', start_color='FCE4D6', end_color='FCE4D6')
     FLAG_FILL = PatternFill('solid', start_color='BDD7EE', end_color='BDD7EE')
 
-    # カテゴリ別カラー：画面の縦棒グラフ（Plotlyデフォルト配色、カテゴリ出現率の多い順に割当）と
-    # 同じ色を使う。「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
-    PLOTLY_COLORS = ['636EFA','EF553B','00CC96','AB63FA','FFA15A',
-                      '19D3F3','FF6692','B6E880','FF97FF','FECB52']
+    # カテゴリ別カラー：画面の縦棒グラフ（st.plotly_chartが既定で適用するStreamlitテーマの
+    # 配色。Plotly自体のデフォルト配色ではない点に注意）と同じ色を、カテゴリ出現率の多い順に
+    # 割り当てる。「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
+    CHART_COLORS = ['83C9FF','0068C9','FFABAB','FF2B2B','7DEFA1',
+                      '29B09D','FFD16A','FF8700','6D3FC0','D5DAE5']
 
     def _lighten_hex(hex_color, factor=0.65):
         """指定した割合(0〜1)だけ白に近づけた淡い色を返す"""
@@ -716,7 +718,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     for c in codes:
         cat_total.setdefault(c['cat_id'], 0)
     cat_order      = sorted(cat_total, key=lambda cid: -cat_total[cid])
-    cat_color_full = {cid: PLOTLY_COLORS[i % len(PLOTLY_COLORS)] for i, cid in enumerate(cat_order)}
+    cat_color_full = {cid: CHART_COLORS[i % len(CHART_COLORS)] for i, cid in enumerate(cat_order)}
     cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
     cat_name_map   = {c['cat_id']: c['cat_name'] for c in codes}
 
@@ -1052,7 +1054,12 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             col  = helper_label_col + 1 + i
             data = Reference(ws2, min_col=col, min_row=chart_hdr_row, max_row=chart_row_end)
             chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
+        # chart.set_categories()は参照先の型に関わらず常にNumRefとして埋め込むため、
+        # コード名（文字列）を渡すとExcel側でX軸の項目名が表示されない。文字列参照として
+        # 明示するため、StrRefを直接組み立ててseries.catに設定する。
+        cats_str = f'{cats}'
+        for series in chart.series:
+            series.cat = AxDataSource(strRef=StrRef(f=cats_str))
         for i, series in enumerate(chart.series):
             cid = cat_order[i]
             series.graphicalProperties = GraphicalProperties(solidFill=cat_color_full.get(cid, 'FFFFFF'))
