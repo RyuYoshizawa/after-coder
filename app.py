@@ -732,6 +732,14 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
     cat_name_map   = {c['cat_id']: c['cat_name'] for c in codes}
 
+    # 「コード別GT集計」「回答別コーディング結果」の列順（順A：カテゴリ出現率順→コード出現率順）
+    cat_rank      = {cid: i for i, cid in enumerate(cat_order)}
+    gt_count_map  = {g['code_id']: g['count'] for g in gt}
+    codes_sorted_a = sorted(
+        codes,
+        key=lambda c: (cat_rank.get(c['cat_id'], len(cat_order)), -gt_count_map.get(c['code_id'], 0))
+    )
+
     def hdr(r, c, v):
         cell = ws.cell(row=r, column=c, value=v)
         cell.font=HDR_FONT; cell.fill=HDR_FILL; cell.border=BORDER
@@ -794,6 +802,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     ws.cell(row=GT_START, column=1, value='■ コード別GT集計').font = SUB_FONT
 
     gt_labels = [
+        'カテゴリー出現率順位',
         'カテゴリ出現数',
         '中間カテゴリID',
         '中間カテゴリ名',
@@ -806,7 +815,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         'ネガティブ件数',
         'ニュートラル件数',
     ]
-    CAT_ID_ROW_INDEX = 1  # gt_labelsのうち「中間カテゴリID」の位置＝フル彩度で塗る行
+    CAT_ID_ROW_INDEX = gt_labels.index('中間カテゴリID')  # フル彩度で塗る行
+    PCT_ROW_INDEX    = gt_labels.index('出現率(%)')
     for i, label in enumerate(gt_labels):
         r = GT_START + 1 + i
         lbl(r, 1, label)
@@ -829,8 +839,8 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
                 if sent in code_sent[cid]:
                     code_sent[cid][sent] += 1
 
-    # コードデータ書き込み
-    for ci, code in enumerate(codes):
+    # コードデータ書き込み（列順は順A：カテゴリ出現率順→コード出現率順）
+    for ci, code in enumerate(codes_sorted_a):
         col  = CODE_START + ci
         cnt  = next((r['count'] for r in gt if r['code_id']==code['code_id']), 0)
         pct  = cnt / total * 100 if total > 0 else 0
@@ -838,6 +848,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         full = cat_color_full.get(code['cat_id'], 'FFFFFF')
         pale = cat_color_pale.get(code['cat_id'], 'FFFFFF')
         vals = [
+            cat_rank.get(code['cat_id'], len(cat_order)) + 1,
             cat_counts.get(code['cat_id'], 0),
             code['cat_id'],
             code['cat_name'],
@@ -857,7 +868,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             c.alignment = Alignment(wrap_text=True, vertical='top')
             row_color = full if ri == CAT_ID_ROW_INDEX else pale
             c.fill = PatternFill('solid', start_color=row_color, end_color=row_color)
-            if ri == 6:  # 出現率
+            if ri == PCT_ROW_INDEX:  # 出現率
                 if pct >= 20:
                     c.fill = HIGH_FILL
                 elif pct <= 2:
@@ -878,7 +889,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         hdr(hdr_row, 4+ci, fc['char'])
         ws.column_dimensions[get_column_letter(4+ci)].width = 4
 
-    for ci, code in enumerate(codes):
+    for ci, code in enumerate(codes_sorted_a):
         col  = CODE_START + ci
         full = cat_color_full.get(code['cat_id'], 'FFFFFF')
         c = ws.cell(row=hdr_row, column=col, value=code['code_id'])
@@ -899,7 +910,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             c = ws.cell(row=r, column=4+ci, value=1 if flagged else '')
             c.font=DATA_FONT; c.border=BORDER
             if flagged: c.fill = FLAG_FILL
-        for ci, code in enumerate(codes):
+        for ci, code in enumerate(codes_sorted_a):
             col  = CODE_START + ci
             flag = 1 if code['code_id'] in assigned else 0
             pale = cat_color_pale.get(code['cat_id'], 'FFFFFF')
