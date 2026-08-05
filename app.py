@@ -1177,13 +1177,17 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         c = ws3.cell(row=hdr_row3, column=DATA_START+ci, value=h)
         c.font = HDR_FONT; c.fill = HDR_FILL; c.border = BORDER
 
+    last_col = DATA_START + len(headers) - 1
+
     def _mark_cell(r, text, color, font_color='FFFFFF'):
-        """カテゴリー／コードの切り替わりを示す見出しをA列のセル1つに入れる（行はまたがない）"""
-        c = ws3.cell(row=r, column=MARK_COL, value=text)
-        c.font = Font(name='Meiryo UI', bold=True, size=10, color=font_color)
-        c.fill = PatternFill('solid', start_color=color, end_color=color)
-        c.border = BORDER
-        c.alignment = Alignment(wrap_text=True, vertical='top')
+        """カテゴリー／コードの切り替わりを示す見出しテキストはA列のみに入れるが、
+        背景色は行の区切りとして視認しやすいよう最終列まで塗る（セルは結合しない）"""
+        for col in range(MARK_COL, last_col + 1):
+            c = ws3.cell(row=r, column=col, value=text if col == MARK_COL else None)
+            c.font = Font(name='Meiryo UI', bold=True, size=10, color=font_color)
+            c.fill = PatternFill('solid', start_color=color, end_color=color)
+            c.border = BORDER
+            c.alignment = Alignment(wrap_text=True, vertical='top')
 
     def _data_row(r, vals):
         for ci, v in enumerate(vals):
