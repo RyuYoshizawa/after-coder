@@ -75,6 +75,12 @@ def _category_color_map(gt, codes):
     cat_color_full = {cid: CHART_COLORS[i % len(CHART_COLORS)] for i, cid in enumerate(cat_order)}
     return cat_order, cat_color_full
 
+
+def _items_from_texts(texts):
+    """1行1回答のプレーンテキスト入力を、Excel入力と同じitems形式に揃える（fa_no・attrsは空）。"""
+    return [{'id': f'NO{i+1:03d}', 'text': t, 'fa_no': None, 'attrs': {}} for i, t in enumerate(texts)]
+
+
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
     page_icon='📊',
@@ -119,6 +125,7 @@ st.session_state.setdefault('history', [])
 st.session_state.setdefault('history_counter', 0)
 st.session_state.setdefault('active_history_id', None)
 st.session_state.setdefault('texts_count', 0)
+st.session_state.setdefault('xlsx_items', [])
 
 
 def render_login():
@@ -1424,11 +1431,12 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
     return results
 
 
-def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, data_context='',
+def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, data_context='',
                   codebook_mode='A', existing_codebook=None, sample_size=None, coding_model=CODING_MODEL,
                   enabled_risks=None):
     """
     コードブック策定（または既存コードブックの読み込み）を行い、指定件数だけコーディング・集計する。
+    itemsは{'id','text','fa_no','attrs'}を持つ回答のリスト（アップロードUI側で構築済み）。
     sample_size=0: コーディングしない（策定のみ）／ None: 全件 ／ それ以外: min(sample_size, 全件数)件
     coding_model・enabled_risksはこの分析（result）に紐づけて保存し、続きをコーディングする際も
     同じ設定を使う（分析の途中でモデルやリスクチェック対象が混在しないようにするため）。
@@ -1436,7 +1444,7 @@ def run_pipeline(api_key, q_name, texts, max_codes, progress_bar, status_text, d
     enabled_risks = enabled_risks or []
     reset_token_usage()
     client = make_client('Anthropic', api_key)
-    all_items = [{'id': f'NO{i+1:03d}', 'text': t} for i, t in enumerate(texts)]
+    all_items = list(items)
     random.shuffle(all_items)
 
     codebook = _generate_codebook_step(
@@ -1677,13 +1685,13 @@ with col1:
 
     input_method = st.radio(
         '入力方法を選択',
-        ['📄 ファイルをアップロード', '📋 テキストを直接貼り付け'],
+        ['📄 テキストファイル', '📋 テキストを直接貼り付け', '📊 Excelファイル（ID・属性列あり）'],
         horizontal=True
     )
 
-    texts = []
+    items = []
 
-    if input_method == '📄 ファイルをアップロード':
+    if input_method == '📄 テキストファイル':
         uploaded = st.file_uploader(
             'テキストファイルを選択（1行1回答）',
             type=['txt'],
@@ -1692,12 +1700,13 @@ with col1:
         if uploaded:
             content = uploaded.read().decode('utf-8', errors='ignore')
             texts   = [line.strip() for line in content.splitlines() if line.strip()]
-            st.success(f'✅ {len(texts)}件の回答を読み込みました')
+            items   = _items_from_texts(texts)
+            st.success(f'✅ {len(items)}件の回答を読み込みました')
             with st.expander('回答プレビュー（先頭5件）'):
-                for i, t in enumerate(texts[:5], 1):
-                    st.markdown(f'**{i}.** {t}')
+                for i, it in enumerate(items[:5], 1):
+                    st.markdown(f'**{i}.** {it["text"]}')
 
-    else:
+    elif input_method == '📋 テキストを直接貼り付け':
         pasted = st.text_area(
             'テキストを貼り付け（1行1回答）',
             height=200,
@@ -1706,27 +1715,69 @@ with col1:
         )
         if pasted:
             texts = [line.strip() for line in pasted.splitlines() if line.strip()]
-            st.success(f'✅ {len(texts)}件の回答を読み込みました')
+            items = _items_from_texts(texts)
+            st.success(f'✅ {len(items)}件の回答を読み込みました')
             with st.expander('回答プレビュー（先頭5件）'):
-                for i, t in enumerate(texts[:5], 1):
-                    st.markdown(f'**{i}.** {t}')
+                for i, it in enumerate(items[:5], 1):
+                    st.markdown(f'**{i}.** {it["text"]}')
 
-if st.session_state.texts_count != len(texts):
-    st.session_state.texts_count = len(texts)
+    else:
+        import pandas as pd
+        uploaded = st.file_uploader(
+            'Excelファイルを選択',
+            type=['xlsx'],
+            help='自由記述に加えて、回答者ID・FA番号・年代や職位などの属性列を含むExcelファイルを読み込めます。'
+                 '属性は集計・コーディングの判断には使われず、レポート表示のためだけに保持されます。'
+        )
+        if uploaded:
+            df = pd.read_excel(uploaded)
+            st.caption(f'{len(df)}行を読み込みました。列の役割を指定してください。')
+            st.dataframe(df.head(), width='stretch')
+
+            text_col = st.selectbox('自由記述の列', df.columns, key='xlsx_text_col')
+            id_col   = st.selectbox('回答者IDの列（任意）', ['(なし・自動採番)'] + list(df.columns), key='xlsx_id_col')
+            fa_col   = st.selectbox('FA番号の列（任意）', ['(なし)'] + list(df.columns), key='xlsx_fa_col')
+            attr_cols = st.multiselect(
+                '属性として使う列（複数選択可・任意。年代・職位など）',
+                [c for c in df.columns if c not in {text_col, id_col, fa_col}],
+                key='xlsx_attr_cols'
+            )
+
+            if st.button('この内容で読み込む'):
+                built = []
+                for i, row in df.iterrows():
+                    text = str(row[text_col]).strip() if pd.notna(row[text_col]) else ''
+                    rid  = (str(row[id_col]) if id_col != '(なし・自動採番)' and pd.notna(row[id_col])
+                            else f'NO{i+1:03d}')
+                    fa   = str(row[fa_col]) if fa_col != '(なし)' and pd.notna(row[fa_col]) else None
+                    attrs = {c: row[c] for c in attr_cols}
+                    built.append({'id': rid, 'text': text, 'fa_no': fa, 'attrs': attrs})
+                st.session_state.xlsx_items = built
+
+            items = st.session_state.get('xlsx_items', [])
+            if items:
+                st.success(f'✅ {len(items)}件の回答を読み込みました')
+                with st.expander('回答プレビュー（先頭5件）'):
+                    for i, it in enumerate(items[:5], 1):
+                        attr_str = '、'.join(f'{k}: {v}' for k, v in it['attrs'].items())
+                        st.markdown(f'**{i}.** [{it["id"]}] {it["text"]}' + (f'　（{attr_str}）' if attr_str else ''))
+
+if st.session_state.texts_count != len(items):
+    st.session_state.texts_count = len(items)
     st.rerun()
 
 with col2:
     st.markdown('### ✅ 分析設定の確認')
-    if texts and q_name and api_key:
+    if items and q_name and api_key:
         st.markdown(f'**設問名：** {q_name}')
-        st.markdown(f'**回答数：** {len(texts)}件')
+        st.markdown(f'**回答数：** {len(items)}件')
         st.markdown(f'**コード上限：** {max_codes}個')
         st.markdown(f'**策定方式：** {codebook_mode_label}')
         st.markdown(f'**コーディングモデル：** {coding_model_label}')
         risk_labels = [o['label'] for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
         st.markdown(f'**リスクチェック：** {"、".join(risk_labels) if risk_labels else "なし"}')
         st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
-        est_min = max(3, len(texts) // 100 * 2)
+        est_min = max(3, len(items) // 100 * 2)
         st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
     else:
         st.info('左サイドバーで設定を入力し、ファイルをアップロードしてください。')
@@ -1737,14 +1788,14 @@ mode_ready   = codebook_mode != 'EXISTING' or existing_codebook_data is not None
 button_label = '📐 コードブック生成開始' if coding_sample_size == 0 else '🚀 分析開始'
 
 if st.button(button_label, type='primary', width='stretch',
-             disabled=not (texts and q_name and api_key and mode_ready)):
+             disabled=not (items and q_name and api_key and mode_ready)):
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
 
     with st.spinner('処理中...'):
         result = run_pipeline(
-            api_key, q_name, texts, max_codes,
+            api_key, q_name, items, max_codes,
             progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
             coding_sample_size, coding_model, enabled_risks
         )
