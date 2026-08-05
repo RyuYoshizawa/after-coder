@@ -1146,7 +1146,10 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             if k not in attr_keys:
                 attr_keys.append(k)
 
-    # (順A用のランク, 元の出現順, コード情報, 回答item) のリストを作り、非該当は別枠に分ける
+    def _attr_sort_key(it):
+        return tuple(str(it.get('attrs', {}).get(k, '')) for k in attr_keys)
+
+    # (順A用のランク, 属性値の並び, 元の出現順, コード情報, 回答item) のリストを作り、非該当は別枠に分ける
     coded_rows, unassigned_items = [], []
     for ri, res in enumerate(results):
         it = item_map_full.get(res.get('id'))
@@ -1159,38 +1162,45 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         for cid in assigned:
             code = code_lookup.get(cid)
             if code:
-                coded_rows.append((code_rank.get(cid, len(codes_sorted_a)), ri, code, it))
-    coded_rows.sort(key=lambda x: (x[0], x[1]))
+                coded_rows.append((code_rank.get(cid, len(codes_sorted_a)), _attr_sort_key(it), ri, code, it))
+    # 順A（カテゴリ→コード）を主キーに、属性１・属性２・属性３…の値を副キーとして並べる
+    coded_rows.sort(key=lambda x: (x[0], x[1], x[2]))
 
+    # 列構成：A列＝カテゴリー/コードの見出し専用（データは持たない）、B列以降が実データ
+    MARK_COL = 1
+    DATA_START = 2
     headers = ['カテゴリー名', 'コード名', '回答者ID', 'FA番号', '自由記述'] + attr_keys
-    n_cols  = len(headers)
     hdr_row3 = 4
+    hdr_mark = ws3.cell(row=hdr_row3, column=MARK_COL)
+    hdr_mark.font = HDR_FONT; hdr_mark.fill = HDR_FILL; hdr_mark.border = BORDER
     for ci, h in enumerate(headers):
-        c = ws3.cell(row=hdr_row3, column=1+ci, value=h)
+        c = ws3.cell(row=hdr_row3, column=DATA_START+ci, value=h)
         c.font = HDR_FONT; c.fill = HDR_FILL; c.border = BORDER
 
-    def _group_row(r, text, color, font_color='FFFFFF'):
-        c = ws3.cell(row=r, column=1, value=text)
-        c.font = Font(name='Meiryo UI', bold=True, size=11, color=font_color)
+    def _mark_cell(r, text, color, font_color='FFFFFF'):
+        """カテゴリー／コードの切り替わりを示す見出しをA列のセル1つに入れる（行はまたがない）"""
+        c = ws3.cell(row=r, column=MARK_COL, value=text)
+        c.font = Font(name='Meiryo UI', bold=True, size=10, color=font_color)
         c.fill = PatternFill('solid', start_color=color, end_color=color)
-        ws3.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols)
+        c.border = BORDER
+        c.alignment = Alignment(wrap_text=True, vertical='top')
 
     def _data_row(r, vals):
         for ci, v in enumerate(vals):
-            c = ws3.cell(row=r, column=1+ci, value=v)
+            c = ws3.cell(row=r, column=DATA_START+ci, value=v)
             c.font = DATA_FONT; c.border = BORDER
             c.alignment = Alignment(wrap_text=True, vertical='top')
 
     r = hdr_row3 + 1
     prev_cat = prev_code = None
-    for _, _, code, it in coded_rows:
+    for _, _, _, code, it in coded_rows:
         cat_id = code['cat_id']
         if cat_id != prev_cat:
-            _group_row(r, f"■ カテゴリー：{code['cat_name']}", cat_color_full.get(cat_id, '808080'))
+            _mark_cell(r, f"■ カテゴリー：{code['cat_name']}", cat_color_full.get(cat_id, '808080'))
             r += 1
             prev_cat, prev_code = cat_id, None
         if code['code_id'] != prev_code:
-            _group_row(r, f"▶ コード：{code['code_name']}", cat_color_pale.get(cat_id, 'D9D9D9'), font_color='000000')
+            _mark_cell(r, f"▶ コード：{code['code_name']}", cat_color_pale.get(cat_id, 'D9D9D9'), font_color='000000')
             r += 1
             prev_code = code['code_id']
         _data_row(r, [code['cat_name'], code['code_name'], it['id'], it.get('fa_no') or '', it['text']]
@@ -1198,21 +1208,22 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         r += 1
 
     if unassigned_items:
-        _group_row(r, '■ 非該当（コードなし）', '808080')
+        _mark_cell(r, '■ 非該当（コードなし）', '808080')
         r += 1
-        for it in unassigned_items:
+        for it in sorted(unassigned_items, key=_attr_sort_key):
             _data_row(r, ['', '', it['id'], it.get('fa_no') or '', it['text']]
                       + [it.get('attrs', {}).get(k, '') for k in attr_keys])
             r += 1
 
-    ws3.column_dimensions['A'].width = 20
-    ws3.column_dimensions['B'].width = 25
-    ws3.column_dimensions['C'].width = 12
-    ws3.column_dimensions['D'].width = 10
-    ws3.column_dimensions['E'].width = 50
+    ws3.column_dimensions[get_column_letter(MARK_COL)].width = 26
+    ws3.column_dimensions[get_column_letter(DATA_START)].width   = 20  # カテゴリー名
+    ws3.column_dimensions[get_column_letter(DATA_START+1)].width = 25  # コード名
+    ws3.column_dimensions[get_column_letter(DATA_START+2)].width = 12  # 回答者ID
+    ws3.column_dimensions[get_column_letter(DATA_START+3)].width = 10  # FA番号
+    ws3.column_dimensions[get_column_letter(DATA_START+4)].width = 50  # 自由記述
     for ci in range(len(attr_keys)):
-        ws3.column_dimensions[get_column_letter(6+ci)].width = 14
-    ws3.freeze_panes = f'A{hdr_row3+1}'
+        ws3.column_dimensions[get_column_letter(DATA_START+5+ci)].width = 14
+    ws3.freeze_panes = f'{get_column_letter(DATA_START)}{hdr_row3+1}'
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -2163,8 +2174,12 @@ if active_result:
         df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
         df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
         _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
-        _cat_name_map = {c['cat_id']: c['cat_name'] for c in result['codes']}
-        color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order}
+        # 色マップのキーは、df_plot（gt由来）と必ず同じcat_nameソースから作る。
+        # result['codes']（現在のコードブック）から作ると、コードブック編集でカテゴリ名を
+        # 変更した後（gt側は編集前の名前のまま）に名前が食い違い、Plotlyが該当カテゴリの色を
+        # 見つけられず自動配色にフォールバックしてしまう（「グラフの色がたまに乱れる」不具合の原因）。
+        _cat_name_map = {g['cat_id']: g['cat_name'] for g in gt}
+        color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order if cid in _cat_name_map}
         fig = px.bar(
             df_plot,
             x='コード名',
