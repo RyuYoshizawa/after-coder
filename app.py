@@ -10,6 +10,7 @@ import json
 import re
 import time
 import random
+import math
 import io
 import openpyxl
 from pathlib import Path
@@ -1242,15 +1243,29 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
 
 CODEBOOK_MODES = [
     {'code': 'A',        'label': '方式A：標準'},
-    {'code': 'B',        'label': '方式B：トップダウン＋ボトムアップ（推奨）'},
+    {'code': 'B',        'label': '方式B：トップダウン＋ボトムアップ'},
     {'code': 'C1',       'label': '方式C1：全件精査（1/4抽出）'},
     {'code': 'C2',       'label': '方式C2：全件精査（ハーフ抽出）'},
     {'code': 'C3',       'label': '方式C3：全件精査（フル抽出）'},
+    {'code': 'C_AUTO',   'label': '方式C-自動：全件精査（件数自動調整）（推奨）'},
     {'code': 'EXISTING', 'label': '既存のコードブックを使用（アップロード）'},
 ]
 CODEBOOK_MODE_LABELS  = [m['label'] for m in CODEBOOK_MODES]
 CODEBOOK_MODE_CODE    = {m['label']: m['code'] for m in CODEBOOK_MODES}
 CODEBOOK_MODE_C_RATIO = {'C1': 0.25, 'C2': 0.5, 'C3': 1.0}
+
+
+def _auto_sample_ratio(n):
+    """
+    方式C-自動のStage1抽出比率。抽出数f(N) = min(N, 10√N, 1000)をNで割った比率を返す。
+    - N≤100：全部読む（f(N)=Nとなるのは N≤100 のときのみ、10√N≥Nと同値）
+    - N>100：10√Nで緩やかに増やす（サンプル比率はNが大きいほど下がる）
+    - N>10,000：10√N≥1000となるため1000件で頭打ち
+    """
+    if n <= 0:
+        return 1.0
+    target = min(n, 10 * math.sqrt(n), 1000)
+    return target / n
 
 
 def _diff_detect_loop(client, codebook, remaining, max_codes, q_name, progress_bar, p_start=0.05, p_end=0.30):
@@ -1495,6 +1510,9 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
         progress_bar.progress(0.30)
     elif codebook_mode == 'B':
         codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
+    elif codebook_mode == 'C_AUTO':
+        ratio = _auto_sample_ratio(len(all_items))
+        codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
     elif codebook_mode in CODEBOOK_MODE_C_RATIO:
         ratio = CODEBOOK_MODE_C_RATIO[codebook_mode]
         codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
@@ -1689,14 +1707,14 @@ with st.sidebar:
     codebook_mode_label = st.selectbox(
         'コードブック策定方式',
         CODEBOOK_MODE_LABELS,
-        index=1,
+        index=CODEBOOK_MODE_LABELS.index('方式C-自動：全件精査（件数自動調整）（推奨）'),
         label_visibility='collapsed',
     )
     codebook_mode = CODEBOOK_MODE_CODE[codebook_mode_label]
 
     n_texts = st.session_state.texts_count
     if n_texts >= 2000 and codebook_mode in ('A', 'B'):
-        st.info(f'📊 {n_texts}件のデータには方式C1〜C3を推奨します')
+        st.info(f'📊 {n_texts}件のデータには方式C-自動（またはC1〜C3）を推奨します')
     elif n_texts >= 500 and codebook_mode == 'A':
         st.info(f'📊 {n_texts}件のデータには方式B以上を推奨します')
 
