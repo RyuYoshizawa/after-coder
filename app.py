@@ -1130,7 +1130,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     ws3.sheet_view.showGridLines = False
 
     ws3.cell(row=1, column=1, value=f'自由回答一覧：{q_name}').font = Font(
-        name='Meiryo UI', bold=True, size=14, color='2E5C8A')
+        name='Meiryo UI', bold=True, size=16, color='2E5C8A')
     ws3.cell(row=2, column=1,
              value=f'集計日時: {datetime.now().strftime("%Y/%m/%d %H:%M")}  有効回答数: {total}件').font = Font(
         name='Meiryo UI', size=10, color='808080')
@@ -1173,18 +1173,20 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     hdr_row3 = 4
     hdr_mark = ws3.cell(row=hdr_row3, column=MARK_COL)
     hdr_mark.font = HDR_FONT; hdr_mark.fill = HDR_FILL; hdr_mark.border = BORDER
+    hdr_mark.alignment = Alignment(wrap_text=False, vertical='center')
     for ci, h in enumerate(headers):
         c = ws3.cell(row=hdr_row3, column=DATA_START+ci, value=h)
         c.font = HDR_FONT; c.fill = HDR_FILL; c.border = BORDER
+        c.alignment = Alignment(wrap_text=False, vertical='center')
 
     last_col = DATA_START + len(headers) - 1
 
-    def _mark_cell(r, text, color, font_color='FFFFFF'):
+    def _mark_cell(r, text, color, size, font_color='FFFFFF'):
         """カテゴリー／コードの切り替わりを示す見出しテキストはA列のみに入れるが、
         背景色は行の区切りとして視認しやすいよう最終列まで塗る（セルは結合しない）"""
         for col in range(MARK_COL, last_col + 1):
             c = ws3.cell(row=r, column=col, value=text if col == MARK_COL else None)
-            c.font = Font(name='Meiryo UI', bold=True, size=10, color=font_color)
+            c.font = Font(name='Meiryo UI', bold=True, size=size, color=font_color)
             c.fill = PatternFill('solid', start_color=color, end_color=color)
             c.border = BORDER
             c.alignment = Alignment(wrap_text=True, vertical='top')
@@ -1200,11 +1202,11 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     for _, _, _, code, it in coded_rows:
         cat_id = code['cat_id']
         if cat_id != prev_cat:
-            _mark_cell(r, f"■ カテゴリー：{code['cat_name']}", cat_color_full.get(cat_id, '808080'))
+            _mark_cell(r, f"■ カテゴリー：{code['cat_name']}", cat_color_full.get(cat_id, '808080'), size=14)
             r += 1
             prev_cat, prev_code = cat_id, None
         if code['code_id'] != prev_code:
-            _mark_cell(r, f"▶ コード：{code['code_name']}", cat_color_pale.get(cat_id, 'D9D9D9'), font_color='000000')
+            _mark_cell(r, f"▶ コード：{code['code_name']}", cat_color_pale.get(cat_id, 'D9D9D9'), size=12, font_color='000000')
             r += 1
             prev_code = code['code_id']
         _data_row(r, [code['cat_name'], code['code_name'], it['id'], it.get('fa_no') or '', it['text']]
@@ -1212,7 +1214,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         r += 1
 
     if unassigned_items:
-        _mark_cell(r, '■ 非該当（コードなし）', '808080')
+        _mark_cell(r, '■ 非該当（コードなし）', '808080', size=14)
         r += 1
         for it in sorted(unassigned_items, key=_attr_sort_key):
             _data_row(r, ['', '', it['id'], it.get('fa_no') or '', it['text']]
@@ -1776,6 +1778,19 @@ with st.sidebar:
                 st.rerun()
     else:
         st.caption('まだ分析履歴がありません')
+
+    st.divider()
+    if st.button('🔄 設定をリセット（新しい分析用）', width='stretch',
+                 help='アップロード中のExcelデータやリスクチェックのチェック状態など、'
+                      '分析条件だけをリセットします。APIキー・作業履歴は保持されます。'
+                      '新しいデータで分析を始める前に、古い設定が残っていないか不安な場合に押してください。'):
+        st.session_state.xlsx_items = []
+        for k in ('xlsx_text_col', 'xlsx_id_col', 'xlsx_fa_col', 'xlsx_attr_cols'):
+            st.session_state.pop(k, None)
+        for opt in RISK_CHECK_OPTIONS:
+            st.session_state.pop(f"risk_{opt['key']}", None)
+        st.session_state.texts_count = 0
+        st.rerun()
 
     st.divider()
     if st.button('🚪 ログアウト', width='stretch'):
