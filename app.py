@@ -2198,19 +2198,22 @@ if active_result:
             horizontal=True
         )
 
-        cat_total = {}
-        for item in gt:
-            cat_total[item['cat_id']] = cat_total.get(item['cat_id'], 0) + item['count']
+        _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
+        # カテゴリの並び順は、生の出現数合計（cat_total）ではなく、_category_color_mapが
+        # 確定させた順位（cat_rank）で決める。2つのカテゴリの合計が同数タイになった場合、
+        # 生の合計値だけをソートキーにすると「タイの間はコード件数だけで全体を横断比較」して
+        # しまい、同じカテゴリのコード同士が分断されて隣り合わなくなる（色分けが乱れて見える
+        # 不具合の原因）。ランク（整数の順位）を使えばタイでも必ずカテゴリごとに固まる。
+        _cat_rank = {cid: i for i, cid in enumerate(_cat_order)}
 
         if sort_mode == '順B：コード出現率が多い順':
             gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
         else:
-            gt_sorted = sorted(gt, key=lambda x: (-cat_total.get(x['cat_id'], 0), -x['count']))
+            gt_sorted = sorted(gt, key=lambda x: (_cat_rank.get(x['cat_id'], len(_cat_order)), -x['count']))
 
         import plotly.express as px
         df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
         df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
-        _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
         # 色マップのキーは、df_plot（gt由来）と必ず同じcat_nameソースから作る。
         # result['codes']（現在のコードブック）から作ると、コードブック編集でカテゴリ名を
         # 変更した後（gt側は編集前の名前のまま）に名前が食い違い、Plotlyが該当カテゴリの色を
