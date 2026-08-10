@@ -662,39 +662,26 @@ def _codebook_rows(codebook, gt_by_code=None, include_stats=False):
     return rows
 
 
-def render_codebook_structure(codebook, key=None):
+def render_codebook_structure(codebook, gt_by_code=None, key=None):
     """
-    コードブックの構造（カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード）のみを、
-    折りたたまず常時表示する。編集直後もその場で最新の内容が確認できる。
+    コードブックの構造（件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード）を、
+    折りたたまず常時表示する。件数・出現率はgt_by_codeを渡せばコーディング結果を反映し、
+    渡さない（または未コーディングの）コードは0として表示する。編集直後もその場で最新の内容が確認できる。
     セルをダブルクリックするとテキストを全文選択・コピーできる（st.data_editorを表示専用に使用。
     ここでの編集内容は保存されない＝実際のコードブックには反映されない）。
-    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる。
+    表右上のツールバーからCSVダウンロードでき、そのCSVは「既存のコードブックを使用」で再読み込みできる
+    （件数・出現率の列は読み込み時に無視される）。
     """
     import pandas as pd
-    rows = _codebook_rows(codebook)
+    rows = _codebook_rows(codebook, gt_by_code, include_stats=True)
     n_cats = len(codebook.get('categories', []))
     st.caption(f'カテゴリ{n_cats}／コード{len(rows)}　※セルをダブルクリックするとテキストをコピーできます（ここでの編集内容は保存されません）')
     st.data_editor(pd.DataFrame(rows), width='stretch', hide_index=True, key=key)
 
 
-def render_code_list_table(codebook, gt_by_code=None, expanded=False, key=None):
-    """
-    コーディング結果に基づく「コード一覧集計」を折りたたみ表示する。
-    列順は 件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード。
-    gt_by_codeを渡さない、または未コーディングのコードは件数・出現率とも0として表示する。
-    セルをダブルクリックするとテキストを全文選択・コピーできる（render_codebook_structureと同様）。
-    """
-    import pandas as pd
-    rows = _codebook_rows(codebook, gt_by_code, include_stats=True)
-    n_cats = len(codebook.get('categories', []))
-    with st.expander(f'📋 コード一覧集計（カテゴリ{n_cats}／コード{len(rows)}）', expanded=expanded):
-        st.caption('※セルをダブルクリックするとテキストをコピーできます（ここでの編集内容は保存されません）')
-        st.data_editor(pd.DataFrame(rows), width='stretch', hide_index=True, key=key)
-
-
 def parse_codebook_csv(file_bytes):
     """
-    render_codebook_structure/render_code_list_tableの表からダウンロードしたCSV
+    render_codebook_structureの表からダウンロードしたCSV
     （カテゴリID,カテゴリ名,コードID,コード名,定義,キーワード。件数・出現率列があっても無視する）を
     コードブック構造（{'categories': [...]}）に復元する
     """
@@ -2018,9 +2005,10 @@ if active_result:
             'コーディングはコードブックをプロンプトキャッシュしており、2回目以降のバッチはキャッシュ読込分が割安になります。'
         )
 
-    # ── コードブック（構造のみ。折りたたまず常時表示、編集直後もその場で最新反映） ──
+    # ── コードブック（GT数値付き。折りたたまず常時表示、編集直後もその場で最新反映） ──
+    gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
     st.markdown('#### 📐 コードブック')
-    render_codebook_structure(result['codebook'], key='codebook_current')
+    render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_current')
 
     # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
     st.caption(
@@ -2054,7 +2042,7 @@ if active_result:
     pending_edit = result.get('pending_edit')
     if pending_edit:
         st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
-        render_codebook_structure(pending_edit['codebook'], key='codebook_pending')
+        render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_pending')
         pc1, pc2 = st.columns(2)
         with pc1:
             if st.button('✅ この内容で確定する', type='primary', width='stretch'):
@@ -2202,9 +2190,6 @@ if active_result:
             df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
             df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
             st.dataframe(df_cat, width='stretch', hide_index=True)
-
-        gt_by_code = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in gt}
-        render_code_list_table(result['codebook'], gt_by_code=gt_by_code, key='code_list_table')
 
         st.divider()
 
