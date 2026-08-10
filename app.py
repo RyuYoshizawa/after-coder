@@ -134,6 +134,7 @@ st.session_state.setdefault('history_counter', 0)
 st.session_state.setdefault('active_history_id', None)
 st.session_state.setdefault('texts_count', 0)
 st.session_state.setdefault('xlsx_items', [])
+st.session_state.setdefault('coding_job', None)
 
 
 def render_login():
@@ -1556,31 +1557,64 @@ CODING_SCOPE_SIZES   = {
 }
 
 
+CODING_BATCH_SIZE = 15
+
+
+def _code_one_batch(client, q_name, codes, batch, coding_model, enabled_risks, coding_strictness):
+    """1バッチ分をコーディングし、無回答（空欄）のルールベース判定を上書きして返す"""
+    res = llm_code_batch(client, batch, codes, q_name, model=coding_model, enabled_risks=enabled_risks,
+                         strictness=coding_strictness)
+    # 無回答（空欄）はAIに判定させず、回答テキストから機械的に確定させる。
+    # 空欄なのに「不明」も立ってしまうと二重計上になるため、その場合はunclearを上書きする。
+    batch_text = {x['id']: x['text'] for x in batch}
+    for r in res:
+        unanswered = not batch_text.get(r.get('id'), '').strip()
+        r['unanswered'] = unanswered
+        if unanswered:
+            r['unclear'] = False
+    return res
+
+
 def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90,
                  coding_model=CODING_MODEL, enabled_risks=None, coding_strictness=CODING_STRICTNESS):
     """itemsをコーディングし、結果リストを返す（集計は行わない）"""
     if not items:
         return []
-    BATCH   = 15
     results = []
-    batches = [items[i:i+BATCH] for i in range(0, len(items), BATCH)]
+    batches = [items[i:i+CODING_BATCH_SIZE] for i in range(0, len(items), CODING_BATCH_SIZE)]
     for bi, batch in enumerate(batches):
-        res = llm_code_batch(client, batch, codes, q_name, model=coding_model, enabled_risks=enabled_risks,
-                             strictness=coding_strictness)
-        # 無回答（空欄）はAIに判定させず、回答テキストから機械的に確定させる。
-        # 空欄なのに「不明」も立ってしまうと二重計上になるため、その場合はunclearを上書きする。
-        batch_text = {x['id']: x['text'] for x in batch}
-        for r in res:
-            unanswered = not batch_text.get(r.get('id'), '').strip()
-            r['unanswered'] = unanswered
-            if unanswered:
-                r['unclear'] = False
+        res = _code_one_batch(client, q_name, codes, batch, coding_model, enabled_risks, coding_strictness)
         results.extend(res)
         pct = p_start + (p_end - p_start) * ((bi+1) / len(batches))
         progress_bar.progress(min(pct, p_end))
         status_text.markdown(f'**コーディング中...** {bi+1}/{len(batches)}バッチ')
         time.sleep(0.1)
     return results
+
+
+def _build_codebook_and_codes(client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+                               codebook_mode, existing_codebook):
+    """コードブックを策定（または既存コードブックを使用）し、(codebook, codes)を返す。失敗時は(None, None)。"""
+    codebook = _generate_codebook_step(
+        client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+        codebook_mode, existing_codebook
+    )
+    if not codebook:
+        reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+        st.error(
+            'コードブック生成に失敗しました。再度お試しください。'
+            + f'\n\n詳細: {reason}'
+        )
+        return None, None
+
+    codes = [
+        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+        for cat in codebook.get('categories', [])
+        for c in cat.get('codes', [])
+    ]
+    status_text.markdown(f'**コードブック完成：{len(codes)}コード ✓**')
+    progress_bar.progress(0.30)
+    return codebook, codes
 
 
 def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, data_context='',
@@ -1599,25 +1633,12 @@ def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, d
     all_items = list(items)
     random.shuffle(all_items)
 
-    codebook = _generate_codebook_step(
+    codebook, codes = _build_codebook_and_codes(
         client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
         codebook_mode, existing_codebook
     )
     if not codebook:
-        reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-        st.error(
-            'コードブック生成に失敗しました。再度お試しください。'
-            + f'\n\n詳細: {reason}'
-        )
         return None
-
-    codes = [
-        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-        for cat in codebook.get('categories', [])
-        for c in cat.get('codes', [])
-    ]
-    status_text.markdown(f'**コードブック完成：{len(codes)}コード ✓**')
-    progress_bar.progress(0.30)
 
     total_items = len(all_items)
     n = total_items if sample_size is None else min(sample_size, total_items)
@@ -1653,55 +1674,115 @@ def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, d
     }
 
 
-def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, progress_bar, status_text,
-                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL, enabled_risks=None,
-                     coding_strictness=CODING_STRICTNESS):
-    """既存のコーディング結果に続けて、未コーディング分から追加でadd_size件をコーディングする"""
-    enabled_risks = enabled_risks or []
-    reset_token_usage()
-    client = make_client('Anthropic', api_key)
+def _start_coding_job(kind, api_key, q_name, codes, items, target_count, history_id,
+                       coding_model, enabled_risks, coding_strictness,
+                       reset_usage=True, prior_usage=None):
+    """
+    バッチ単位で1回のスクリプト再実行ごとに1バッチだけ処理する、中断可能なコーディングジョブを開始する。
+    kind='initial'：分析開始ボタン（コードブック策定は既に同期実行済み、reset_usage=Falseで呼ぶ＝
+    策定分のトークンを引き継ぐ）。kind='recode'：「現在のコードブックでコーディングする」ボタン
+    （reset_usage=Trueで呼び、このジョブ単体のトークン消費をprior_usageに加算する。4.6節参照）。
+    """
+    if reset_usage:
+        reset_token_usage()
+    st.session_state.coding_job = {
+        'kind':              kind,
+        'api_key':           api_key,
+        'q_name':            q_name,
+        'codes':             codes,
+        'items':             items[:target_count],
+        'batch_index':       0,
+        'results':           [],
+        'coding_model':      coding_model,
+        'enabled_risks':     enabled_risks or [],
+        'coding_strictness': coding_strictness,
+        'history_id':        history_id,
+        'prior_usage':       prior_usage,
+        'stop_requested':    False,
+    }
 
-    total_items = len(all_items)
-    new_count   = min(coded_count + add_size, total_items)
-    new_items   = all_items[coded_count:new_count]
 
-    new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90,
-                               coding_model=coding_model, enabled_risks=enabled_risks,
-                               coding_strictness=coding_strictness)
-
-    status_text.markdown('**集計中...**')
-    results = (prior_results or []) + new_results
+def _finalize_coding_job(job):
+    """ジョブの結果（中断時は途中までの分）を集計し、対応する作業履歴エントリに反映する"""
+    n = len(job['results'])
     gt, sent_counts, unassigned, risk_counts, answer_type_counts = aggregate_results(
-        codes, results, new_count, risk_keys=enabled_risks)
-    progress_bar.progress(1.0)
-    status_text.markdown('**✅ 完了！**')
+        job['codes'], job['results'], n, risk_keys=job['enabled_risks'])
 
     usage = get_token_usage()
-    if prior_usage:
+    if job.get('prior_usage'):
+        prior = job['prior_usage']
         usage = {
-            'input':          usage.get('input', 0)          + prior_usage.get('input', 0),
-            'output':         usage.get('output', 0)         + prior_usage.get('output', 0),
-            'cache_read':     usage.get('cache_read', 0)     + prior_usage.get('cache_read', 0),
-            'cache_creation': usage.get('cache_creation', 0) + prior_usage.get('cache_creation', 0),
-            'cost_jpy':       usage.get('cost_jpy', 0)       + prior_usage.get('cost_jpy', 0),
+            'input':          usage.get('input', 0)          + prior.get('input', 0),
+            'output':         usage.get('output', 0)         + prior.get('output', 0),
+            'cache_read':     usage.get('cache_read', 0)     + prior.get('cache_read', 0),
+            'cache_creation': usage.get('cache_creation', 0) + prior.get('cache_creation', 0),
+            'cost_jpy':       usage.get('cost_jpy', 0)       + prior.get('cost_jpy', 0),
         }
 
-    return {
-        'results':            results,
-        'coded_count':        new_count,
+    finalized = {
+        'results':            job['results'],
+        'coded_count':        n,
         'gt':                 gt,
         'sent':               sent_counts,
         'unassigned':         unassigned,
         'risk_counts':        risk_counts,
+        'enabled_risks':      job['enabled_risks'],
         'answer_type_counts': answer_type_counts,
         'usage':              usage,
+        'coding_model':       job['coding_model'],
+        'coding_strictness':  job['coding_strictness'],
     }
+    for h in st.session_state.history:
+        if h['id'] == job['history_id']:
+            h['result'].update(finalized)
+            break
+
+
+def _render_coding_job():
+    """
+    進行中のコーディングジョブを1バッチだけ進め、進捗と「中断する」ボタンを表示してrerunする。
+    Streamlitは1回のスクリプト実行が終わるまで新しい操作を処理しないため、for文で全バッチを
+    一気に処理すると「中断する」ボタンを押しても反応しない。1バッチ処理するたびにst.rerun()で
+    スクリプトを終了・再開することで、バッチの合間（実際のAPI呼び出しで数秒かかる）に中断ボタンの
+    クリックを処理できるようにしている。
+    """
+    job     = st.session_state.coding_job
+    items   = job['items']
+    batches = [items[i:i+CODING_BATCH_SIZE] for i in range(0, len(items), CODING_BATCH_SIZE)]
+    total_batches = len(batches)
+    processed     = min(job['batch_index'] * CODING_BATCH_SIZE, len(items))
+
+    st.markdown('#### コーディング中...')
+    st.progress(job['batch_index'] / total_batches if total_batches else 1.0)
+    st.markdown(f'**{processed}/{len(items)}件処理済み**')
+    if st.button('⏹ 中断する（それまでの結果を保存）', width='stretch'):
+        job['stop_requested'] = True
+
+    if job['stop_requested'] or job['batch_index'] >= total_batches:
+        _finalize_coding_job(job)
+        st.session_state.coding_job = None
+        st.rerun()
+        return
+
+    client = make_client('Anthropic', job['api_key'])
+    batch  = batches[job['batch_index']]
+    res = _code_one_batch(client, job['q_name'], job['codes'], batch,
+                           job['coding_model'], job['enabled_risks'], job['coding_strictness'])
+    job['results'].extend(res)
+    job['batch_index'] += 1
+    st.rerun()
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
 
 st.markdown('<p class="main-title">👻 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">アップロードした自由文回答テキストを自動でコーディングし集計します</p>', unsafe_allow_html=True)
+
+# コーディングジョブが進行中は、進捗＋中断ボタンだけを表示してスクリプトを終了する
+# （サイドバー・結果表示など他のUIは中断可否に関わらず操作させない）。
+if st.session_state.coding_job:
+    _render_coding_job()
+    st.stop()
 
 # ── サイドバー：設定 ──────────────────────────────
 with st.sidebar:
@@ -1969,27 +2050,78 @@ button_label = '📐 コードブック生成開始' if coding_sample_size == 0 
 if st.button(button_label, type='primary', width='stretch',
              disabled=not (items and q_name and api_key and mode_ready)):
 
-    progress_bar = st.progress(0)
-    status_text  = st.empty()
+    if coding_sample_size == 0:
+        # コーディングを伴わない策定のみ：中断機能は不要なので従来通り同期実行する
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        with st.spinner('処理中...'):
+            result = run_pipeline(
+                api_key, q_name, items, max_codes,
+                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
+                coding_sample_size, coding_model, enabled_risks, coding_strictness
+            )
+        if result:
+            st.session_state.history_counter += 1
+            hist_entry = {
+                'id':        st.session_state.history_counter,
+                'q_name':    q_name,
+                'timestamp': datetime.now(),
+                'result':    result,
+            }
+            st.session_state.history.append(hist_entry)
+            st.session_state.history = st.session_state.history[-10:]
+            st.session_state.active_history_id = hist_entry['id']
+    else:
+        # コーディングを伴う場合：策定は同期実行し、コーディングは中断可能なジョブとして開始する
+        reset_token_usage()
+        client = make_client('Anthropic', api_key)
+        all_items = list(items)
+        random.shuffle(all_items)
 
-    with st.spinner('処理中...'):
-        result = run_pipeline(
-            api_key, q_name, items, max_codes,
-            progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
-            coding_sample_size, coding_model, enabled_risks, coding_strictness
-        )
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        with st.spinner('コードブックを策定中...'):
+            codebook, codes = _build_codebook_and_codes(
+                client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+                codebook_mode, existing_codebook_data
+            )
 
-    if result:
-        st.session_state.history_counter += 1
-        hist_entry = {
-            'id':        st.session_state.history_counter,
-            'q_name':    q_name,
-            'timestamp': datetime.now(),
-            'result':    result,
-        }
-        st.session_state.history.append(hist_entry)
-        st.session_state.history = st.session_state.history[-10:]
-        st.session_state.active_history_id = hist_entry['id']
+        if codebook:
+            total_items = len(all_items)
+            target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
+
+            st.session_state.history_counter += 1
+            hist_id = st.session_state.history_counter
+            base_result = {
+                'codebook':           codebook,
+                'codes':              codes,
+                'items':              all_items,
+                'results':            [],
+                'coded_count':        0,
+                'total_items':        total_items,
+                'gt':                 [],
+                'sent':               {'positive': 0, 'negative': 0, 'neutral': 0},
+                'unassigned':         0,
+                'risk_counts':        {},
+                'enabled_risks':      enabled_risks,
+                'answer_type_counts': {},
+                'q_name':             q_name,
+                'usage':              get_token_usage(),
+                'coding_model':       coding_model,
+                'coding_strictness':  coding_strictness,
+            }
+            st.session_state.history.append({
+                'id':        hist_id,
+                'q_name':    q_name,
+                'timestamp': datetime.now(),
+                'result':    base_result,
+            })
+            st.session_state.history = st.session_state.history[-10:]
+            st.session_state.active_history_id = hist_id
+
+            _start_coding_job('initial', api_key, q_name, codes, all_items, target, hist_id,
+                               coding_model, enabled_risks, coding_strictness, reset_usage=False)
+            st.rerun()
 
 active_result = None
 active_q_name = None
@@ -2144,24 +2276,15 @@ if active_result:
             st.caption('※ 左ナビの「コーディング範囲」で件数を指定してからコーディングしてください。')
         else:
             if st.button(f'▶ 現在のコードブックでコーディングする（全{coding_target}件）', type='primary', width='stretch'):
-                progress_bar2 = st.progress(0)
-                status_text2  = st.empty()
-                with st.spinner('コーディング中...'):
-                    recoded = continue_coding(
-                        api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                        0, coding_target, progress_bar2, status_text2,
-                        prior_results=None, prior_usage=result.get('usage'),
-                        coding_model=result.get('coding_model', CODING_MODEL),
-                        enabled_risks=result.get('enabled_risks', []),
-                        coding_strictness=result.get('coding_strictness', CODING_STRICTNESS),
-                    )
-                result.update(recoded)
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
+                _start_coding_job(
+                    'recode', api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                    coding_target, st.session_state.active_history_id,
+                    result.get('coding_model', CODING_MODEL), result.get('enabled_risks', []),
+                    result.get('coding_strictness', CODING_STRICTNESS),
+                    reset_usage=True, prior_usage=result.get('usage'),
+                )
                 st.rerun()
-            st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。')
+            st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。実行中は「⏹ 中断する」でそれまでの結果を保存して打ち切れます。')
     st.divider()
 
     # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
