@@ -33,6 +33,13 @@ CODING_MODEL_OPTIONS = {
     'Sonnet 4.6（高精度・高コスト）': 'claude-sonnet-4-6',
 }
 
+CODING_STRICTNESS = 'standard'  # コーディング判定の厳密度デフォルト（サイドバー未選択時など）
+CODING_STRICTNESS_OPTIONS = {
+    '標準':                     'standard',
+    '厳密（誤検出を避ける）':   'strict',
+    '柔軟（見落としを避ける）': 'lenient',
+}
+
 # リスクチェック項目。チェックした項目だけをコーディング時にAIへ問い合わせる（未チェックはコスト0）。
 # key: 内部フィールド名（LLMスキーマ・result内で使用） / label: UI表示名
 # char: Excel「回答別コーディング結果」の一文字見出し / hint: チェックの説明
@@ -450,7 +457,8 @@ code_idは既存コードと同じC0101形式で採番すること（接頭辞�
     return result.get('new_codes', [])
 
 
-def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_risks=None):
+def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_risks=None,
+                    strictness=CODING_STRICTNESS):
     """
     コーディング本体。同じコードブック（system側）を1回のコーディング実行中に何十回も
     使い回すため、コードブック・ルールをsystemに分離しcache_control（プロンプトキャッシュ）を
@@ -460,6 +468,8 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
     作業履歴で比較する使い方を想定している。
     enabled_risksはサイドバーの「リスクチェック」でチェックされた項目のkeyのリスト。
     未チェックの項目はプロンプト・スキーマに一切含めない（AIへの問い合わせ自体をしない＝コスト増なし）。
+    strictnessはサイドバーの「コーディング判定の厳密度」（standard/strict/lenient）。
+    コード付与の判定基準にのみ効かせ、リスクチェック・回答分類の判定基準は変えない。
     """
     enabled_risks = enabled_risks or []
     risk_opts = [o for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
@@ -487,6 +497,16 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
 【リスクチェック】次の該当有無も回答ごとに判定してください（該当すればtrue、しなければfalse）
 {risk_lines}"""
 
+    strictness_rule = ''
+    if strictness == 'strict':
+        strictness_rule = """
+
+【コード判定基準】コードの定義・キーワードに明確に一致する場合のみ付与してください。文脈からの推測だけでは付与しないでください。"""
+    elif strictness == 'lenient':
+        strictness_rule = """
+
+【コード判定基準】コードのテーマに関連する内容であれば、表現が異なっていても幅広く付与してください。文脈から示唆される内容も対象に含めてください。"""
+
     system_prompt = f"""「{q_name}」の回答にコードブックに基づいてコーディングしてください。
 
 【コードブック】
@@ -495,7 +515,7 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
 【ルール】
 - 1回答に複数コード付与可
 - 該当なしはcodesを空配列
-- sentimentは positive/negative/neutral{answer_type_rule}{risk_rule}"""
+- sentimentは positive/negative/neutral{answer_type_rule}{risk_rule}{strictness_rule}"""
 
     items_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
     prompt = f"""【回答】
@@ -1537,7 +1557,7 @@ CODING_SCOPE_SIZES   = {
 
 
 def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start=0.30, p_end=0.90,
-                 coding_model=CODING_MODEL, enabled_risks=None):
+                 coding_model=CODING_MODEL, enabled_risks=None, coding_strictness=CODING_STRICTNESS):
     """itemsをコーディングし、結果リストを返す（集計は行わない）"""
     if not items:
         return []
@@ -1545,7 +1565,8 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
     results = []
     batches = [items[i:i+BATCH] for i in range(0, len(items), BATCH)]
     for bi, batch in enumerate(batches):
-        res = llm_code_batch(client, batch, codes, q_name, model=coding_model, enabled_risks=enabled_risks)
+        res = llm_code_batch(client, batch, codes, q_name, model=coding_model, enabled_risks=enabled_risks,
+                             strictness=coding_strictness)
         # 無回答（空欄）はAIに判定させず、回答テキストから機械的に確定させる。
         # 空欄なのに「不明」も立ってしまうと二重計上になるため、その場合はunclearを上書きする。
         batch_text = {x['id']: x['text'] for x in batch}
@@ -1564,7 +1585,7 @@ def _code_items(client, q_name, codes, items, progress_bar, status_text, p_start
 
 def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, data_context='',
                   codebook_mode='A', existing_codebook=None, sample_size=None, coding_model=CODING_MODEL,
-                  enabled_risks=None):
+                  enabled_risks=None, coding_strictness=CODING_STRICTNESS):
     """
     コードブック策定（または既存コードブックの読み込み）を行い、指定件数だけコーディング・集計する。
     itemsは{'id','text','fa_no','attrs'}を持つ回答のリスト（アップロードUI側で構築済み）。
@@ -1602,7 +1623,8 @@ def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, d
     n = total_items if sample_size is None else min(sample_size, total_items)
 
     results = _code_items(client, q_name, codes, all_items[:n], progress_bar, status_text,
-                           coding_model=coding_model, enabled_risks=enabled_risks)
+                           coding_model=coding_model, enabled_risks=enabled_risks,
+                           coding_strictness=coding_strictness)
 
     status_text.markdown('**集計中...**')
     gt, sent_counts, unassigned, risk_counts, answer_type_counts = aggregate_results(
@@ -1627,11 +1649,13 @@ def run_pipeline(api_key, q_name, items, max_codes, progress_bar, status_text, d
         'q_name':             q_name,
         'usage':              usage,
         'coding_model':       coding_model,
+        'coding_strictness':  coding_strictness,
     }
 
 
 def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, progress_bar, status_text,
-                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL, enabled_risks=None):
+                     prior_results=None, prior_usage=None, coding_model=CODING_MODEL, enabled_risks=None,
+                     coding_strictness=CODING_STRICTNESS):
     """既存のコーディング結果に続けて、未コーディング分から追加でadd_size件をコーディングする"""
     enabled_risks = enabled_risks or []
     reset_token_usage()
@@ -1642,7 +1666,8 @@ def continue_coding(api_key, q_name, codes, all_items, coded_count, add_size, pr
     new_items   = all_items[coded_count:new_count]
 
     new_results = _code_items(client, q_name, codes, new_items, progress_bar, status_text, 0.05, 0.90,
-                               coding_model=coding_model, enabled_risks=enabled_risks)
+                               coding_model=coding_model, enabled_risks=enabled_risks,
+                               coding_strictness=coding_strictness)
 
     status_text.markdown('**集計中...**')
     results = (prior_results or []) + new_results
@@ -1766,6 +1791,16 @@ with st.sidebar:
              '「📜 作業履歴」で結果とコストを見比べてください（1回の分析中でモデルが混在することはありません）。'
     )
     coding_model = CODING_MODEL_OPTIONS[coding_model_label]
+
+    coding_strictness_label = st.selectbox(
+        'コーディング判定の厳密度',
+        list(CODING_STRICTNESS_OPTIONS.keys()),
+        index=0,
+        help='コードを付与する際の判定基準の厳しさです。「厳密」はコードの定義・キーワードに明確に一致する場合のみ付与し、'
+             '誤検出（過剰付与）を減らします（非該当が増える可能性があります）。「柔軟」は表現が違っても幅広く付与し、'
+             '見落としを減らします（過剰付与が増える可能性があります）。リスクチェック・回答分類の判定基準には影響しません。'
+    )
+    coding_strictness = CODING_STRICTNESS_OPTIONS[coding_strictness_label]
 
     st.markdown('**⚠️ リスクチェック（該当有無を検知）**')
     enabled_risks = []
@@ -1941,7 +1976,7 @@ if st.button(button_label, type='primary', width='stretch',
         result = run_pipeline(
             api_key, q_name, items, max_codes,
             progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
-            coding_sample_size, coding_model, enabled_risks
+            coding_sample_size, coding_model, enabled_risks, coding_strictness
         )
 
     if result:
@@ -2118,6 +2153,7 @@ if active_result:
                         prior_results=None, prior_usage=result.get('usage'),
                         coding_model=result.get('coding_model', CODING_MODEL),
                         enabled_risks=result.get('enabled_risks', []),
+                        coding_strictness=result.get('coding_strictness', CODING_STRICTNESS),
                     )
                 result.update(recoded)
                 for h in st.session_state.history:
