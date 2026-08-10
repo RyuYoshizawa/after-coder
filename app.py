@@ -163,7 +163,7 @@ def llm_generate_codebook(client, items, max_codes, q_name, data_context=''):
 {context_str}
 【ルール】
 - 中間カテゴリ7個前後（最大10個）
-- カテゴリ内コード最大10個、総数{max_codes}個以内
+- カテゴリ内コード最大10個、コード総数は必ず{max_codes}個以内に収める（絶対に超えないこと。類似する主題は1つのコードに統合する）
 - 1コード＝1主題
 - コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）
 
@@ -212,7 +212,7 @@ def llm_generate_codebook_topdown(client, data_context, q_name, max_codes):
 
 【ルール】
 - 中間カテゴリ7個前後（最大10個）
-- カテゴリごとに想定コード名を列挙（1カテゴリあたり最大10個、総数{max_codes}個以内）
+- カテゴリごとに想定コード名を列挙（1カテゴリあたり最大10個、コード総数は必ず{max_codes}個以内に収める。絶対に超えないこと）
 - コードIDは不要、コード名のみ列挙
 - カテゴリIDはCAT01形式"""
 
@@ -258,7 +258,7 @@ def llm_elaborate_skeleton(client, skeleton, sample_items, max_codes, q_name, da
 【ルール】
 - 骨格のカテゴリ（cat_id・cat_name）は維持する
 - 想定コードに定義を付与する（サンプルに現れない想定コードも残してよい）
-- サンプルに現れる主題で骨格にないものは追加する（総数{max_codes}個以内）
+- サンプルに現れる主題で骨格にないものは追加する（コード総数は必ず{max_codes}個以内に収める。絶対に超えないこと。追加すると上限を超える場合は既存の想定コードと統合する）
 - 1コード＝1主題
 - コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）"""
 
@@ -360,7 +360,7 @@ def llm_consolidate_topics(client, topics, max_codes, q_name, data_context=''):
 
 【ルール】
 - 類似・重複する主題を統合し、中間カテゴリ7個前後（最大10個）に整理する
-- カテゴリ内コード最大10個、総数{max_codes}個以内
+- カテゴリ内コード最大10個、コード総数は必ず{max_codes}個以内に収める（絶対に超えないこと。主題リストの件数が多い場合は、内容が近い主題同士を積極的に1つのコードにまとめて件数を減らす）
 - 1コード＝1主題
 - 各コードに定義と、判定に役立つキーワードを2〜5個付与する
 - コードID形式: CAT01.../C0101...（コードIDの接頭辞は英字1文字の「C」のみ。「CO」のように2文字以上にしない）"""
@@ -1508,7 +1508,9 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
         status_text.markdown('**アップロードされたコードブックを使用します**')
         codebook = existing_codebook
         progress_bar.progress(0.30)
-    elif codebook_mode == 'B':
+        return codebook
+
+    if codebook_mode == 'B':
         codebook = _build_codebook_b(client, all_items, max_codes, q_name, data_context, progress_bar, status_text)
     elif codebook_mode == 'C_AUTO':
         ratio = _auto_sample_ratio(len(all_items))
@@ -1518,6 +1520,22 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
         codebook = _build_codebook_c(client, all_items, max_codes, q_name, data_context, progress_bar, status_text, ratio)
     else:
         codebook = _build_codebook_a(client, all_items, max_codes, q_name, data_context, progress_bar)
+
+    # プロンプトの「総数N個以内」はあくまで指示であり、LLMが厳密に守るとは限らない
+    # （実際に上限を超えるケースが確認された）。生成直後に総数を確認し、超えていれば
+    # 既存の編集機能（llm_edit_codebook）を使って統合し直す安全弁を設ける。
+    if codebook:
+        total = sum(len(cat.get('codes', [])) for cat in codebook.get('categories', []))
+        if total > max_codes:
+            status_text.markdown(f'**コード数が上限（{max_codes}個）を超えています（{total}個）。統合中...**')
+            instruction = (
+                f'コード総数が{total}個あり、上限の{max_codes}個を超えています。'
+                f'内容が近いコード同士を統合し、必ず総数{max_codes}個以内に収めてください（絶対に超えないこと）。'
+                f'カテゴリ構成やコードIDの命名規則は維持してください。'
+            )
+            trimmed = llm_edit_codebook(client, codebook, instruction, q_name)
+            if trimmed and trimmed.get('categories'):
+                codebook = trimmed
 
     return codebook
 
