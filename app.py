@@ -2096,37 +2096,25 @@ if active_result:
 
     st.divider()
 
-    # ── 現在のコードブックでコーディングする（1ボタン＋全件やり直しボタン） ──
+    # ── 現在のコードブックでコーディングする（1ボタン。左ナビの「コーディング範囲」で指定した件数を、
+    #     毎回コードブックの最新版で最初からコーディングし直す。コードブック編集後に同じ範囲で試し直す
+    #     ／最終的に「全件コーディング」で確定版を作る、という2つの使い方をこの1ボタンでまかなう。
+    #     「未コーディング分だけ追加」方式は廃止した。古いコードブックで処理済みの回答と新しいコード
+    #     ブックで処理した回答が1つの結果内に混在し、最終成果物としての一貫性が崩れるため） ──
     if pending_edit:
         st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
     else:
-        if coded_count < total_items:
-            remaining = total_items - coded_count
-            if st.button(f'▶ 現在のコードブックでコーディングする（残り{remaining}件）', type='primary', width='stretch'):
+        coding_target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
+        if coding_target == 0:
+            st.caption('※ 左ナビの「コーディング範囲」で件数を指定してからコーディングしてください。')
+        else:
+            if st.button(f'▶ 現在のコードブックでコーディングする（全{coding_target}件）', type='primary', width='stretch'):
                 progress_bar2 = st.progress(0)
                 status_text2  = st.empty()
                 with st.spinner('コーディング中...'):
-                    continued = continue_coding(
-                        api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                        coded_count, remaining, progress_bar2, status_text2,
-                        prior_results=result.get('results', []), prior_usage=result.get('usage'),
-                        coding_model=result.get('coding_model', CODING_MODEL),
-                        enabled_risks=result.get('enabled_risks', []),
-                    )
-                result.update(continued)
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
-                st.rerun()
-        if coded_count > 0:
-            if st.button(f'🔁 現在のコードブックで全件コーディングし直す（全{total_items}件）', width='stretch'):
-                progress_bar3 = st.progress(0)
-                status_text3  = st.empty()
-                with st.spinner('コーディング中...'):
                     recoded = continue_coding(
                         api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                        0, total_items, progress_bar3, status_text3,
+                        0, coding_target, progress_bar2, status_text2,
                         prior_results=None, prior_usage=result.get('usage'),
                         coding_model=result.get('coding_model', CODING_MODEL),
                         enabled_risks=result.get('enabled_risks', []),
@@ -2137,7 +2125,7 @@ if active_result:
                         h['result'] = result
                         break
                 st.rerun()
-            st.caption('※ コードの統合・削除などの編集をコーディング済みの回答すべてに反映したい場合は、こちらで最初からやり直してください。')
+            st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。')
     st.divider()
 
     # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
