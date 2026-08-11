@@ -687,6 +687,36 @@ def _codebook_rows(codebook, gt_by_code=None, include_stats=False):
     return rows
 
 
+def _diff_codebook(old_codebook, new_codebook):
+    """
+    2つのコードブックをコードID単位で比較し、削除・追加・変更（コード名または定義が違う）された
+    コードをそれぞれ返す（削除リスト, 追加リスト, 変更リスト[(旧,新), ...]）。
+    編集案プレビューで「具体的に何が変わったか」を示すために使う（コードブック全体を毎回丸ごと
+    表示するだけでは、コード数が多いと変更箇所が埋もれて分からないため）。
+    """
+    def flatten(cb):
+        out = {}
+        for cat in cb.get('categories', []):
+            for c in cat.get('codes', []):
+                out[c.get('code_id')] = {**c, 'cat_name': cat.get('cat_name', '')}
+        return out
+
+    old_codes = flatten(old_codebook)
+    new_codes = flatten(new_codebook)
+
+    removed = [old_codes[cid] for cid in old_codes if cid not in new_codes]
+    added   = [new_codes[cid] for cid in new_codes if cid not in old_codes]
+    changed = [
+        (old_codes[cid], new_codes[cid])
+        for cid in old_codes
+        if cid in new_codes and (
+            old_codes[cid].get('code_name') != new_codes[cid].get('code_name')
+            or old_codes[cid].get('definition') != new_codes[cid].get('definition')
+        )
+    ]
+    return removed, added, changed
+
+
 def render_codebook_structure(codebook, gt_by_code=None, key=None):
     """
     コードブックの構造（件数・出現率(%)・カテゴリID・カテゴリ名・コードID・コード名・定義・キーワード）を、
@@ -2376,6 +2406,24 @@ if active_result:
     pending_edit = result.get('pending_edit')
     if pending_edit:
         st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
+
+        removed, added, changed = _diff_codebook(result['codebook'], pending_edit['codebook'])
+        if removed or added or changed:
+            with st.expander(
+                f'🔍 変更点の詳細（削除{len(removed)}・追加{len(added)}・定義や名称の変更{len(changed)}）',
+                expanded=True,
+            ):
+                for c in removed:
+                    st.markdown(f"- 🗑️ **削除**：{c.get('code_id')}「{c.get('code_name')}」（他のコードへ統合された可能性があります）")
+                for c in added:
+                    st.markdown(f"- ➕ **追加**：{c.get('code_id')}「{c.get('code_name')}」")
+                for o, n in changed:
+                    st.markdown(f"- ✏️ **変更**：{o.get('code_id')}「{o.get('code_name')}」→「{n.get('code_name')}」")
+                    st.caption(f"　旧定義：{o.get('definition', '')}")
+                    st.caption(f"　新定義：{n.get('definition', '')}")
+        else:
+            st.caption('※ コード構成に変更はありませんでした（キーワードなど、表に出づらい細部のみの調整である可能性があります）。')
+
         render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_pending')
         pc1, pc2 = st.columns(2)
         with pc1:
