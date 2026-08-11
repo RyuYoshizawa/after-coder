@@ -135,6 +135,7 @@ st.session_state.setdefault('active_history_id', None)
 st.session_state.setdefault('texts_count', 0)
 st.session_state.setdefault('xlsx_items', [])
 st.session_state.setdefault('coding_job', None)
+st.session_state.setdefault('diagnostic_job', None)
 
 
 def render_login():
@@ -1774,6 +1775,158 @@ def _render_coding_job():
     job['results'].extend(res)
     job['batch_index'] += 1
     st.rerun()
+
+
+def _start_diagnostic(api_key, q_name, codes, items, target_count, history_id, coding_model):
+    """
+    精度診断ジョブを開始する。同じ対象件数を「標準」→「厳密」の順でテストコーディングし、
+    両者でコードの選択が入れ替わった頻度の高いペアを検出、コードブック見直し案を作成する。
+    リスクチェックはコード判定の混同とは無関係なため、診断のコーディングには含めない
+    （コスト削減・診断結果の焦点を絞るため）。
+    """
+    st.session_state.diagnostic_job = {
+        'phase':        'standard',
+        'api_key':      api_key,
+        'q_name':       q_name,
+        'codes':        codes,
+        'items':        items[:target_count],
+        'coding_model': coding_model,
+        'batch_index':  0,
+        'std_results':  [],
+        'strict_results': [],
+        'history_id':   history_id,
+    }
+
+
+def _diagnose_confused_pairs(std_results, strict_results, items, top_n=10):
+    """
+    標準/厳密の2種類のコーディング結果を回答IDで突き合わせ、同じ回答に対して選ばれたコードが
+    入れ替わっていた（標準側にしかないコードと厳密側にしかないコードが両方存在する）頻度の高い
+    コードペアを検出する。頻度上位top_n件と、ペアごとの回答例（最大3件）を返す。
+    """
+    item_text = {x['id']: x['text'] for x in items}
+    std_by_id    = {r['id']: set(r.get('codes', [])) for r in std_results}
+    strict_by_id = {r['id']: set(r.get('codes', [])) for r in strict_results}
+
+    pair_counter = {}
+    pair_examples = {}
+    for rid, scodes in std_by_id.items():
+        tcodes = strict_by_id.get(rid, set())
+        only_s = scodes - tcodes
+        only_t = tcodes - scodes
+        if only_s and only_t:
+            for cs in only_s:
+                for ct in only_t:
+                    key = tuple(sorted([cs, ct]))
+                    pair_counter[key] = pair_counter.get(key, 0) + 1
+                    examples = pair_examples.setdefault(key, [])
+                    if len(examples) < 3:
+                        examples.append(item_text.get(rid, ''))
+
+    top_pairs = sorted(pair_counter.items(), key=lambda kv: -kv[1])[:top_n]
+    return top_pairs, pair_examples
+
+
+def _build_diagnostic_instruction(top_pairs, pair_examples, codes_by_id):
+    """検出した混同ペア＋回答例から、llm_edit_codebookに渡すコードブック見直し指示文を組み立てる"""
+    lines = [
+        '以下は、同じ回答セットを「標準」判定基準と「厳密」判定基準の2通りでコーディングした結果、'
+        '選ばれるコードが入れ替わっていた頻度の高いペアです。各ペアについて、実際に入れ替わった回答例を示します。',
+        '',
+    ]
+    for (c1, c2), cnt in top_pairs:
+        def1 = codes_by_id.get(c1, {})
+        def2 = codes_by_id.get(c2, {})
+        lines.append(f'■ {c1}「{def1.get("code_name", "")}」 <-> {c2}「{def2.get("code_name", "")}」（{cnt}件で選択が入れ替わり）')
+        lines.append(f'  {c1}の定義: {def1.get("definition", "")}')
+        lines.append(f'  {c2}の定義: {def2.get("definition", "")}')
+        for ex in pair_examples.get((c1, c2), []):
+            lines.append(f'  回答例: {ex}')
+        lines.append('')
+    lines.append(
+        '各ペアについて、意味が本質的に重なっており区別する価値が薄いと判断できる場合は1つのコードに統合してください'
+        '（統合後はどちらか一方のコードID・コード名を残し、もう一方は削除する）。'
+        '区別する価値がある場合は、上記の回答例から「どちらに該当するか」を見分けられるよう、'
+        '判断基準を具体的に含めて定義文を書き直してください。'
+        '上記に挙げていないコードは変更しないでください。'
+    )
+    return '\n'.join(lines)
+
+
+def _render_diagnostic_job():
+    """
+    進行中の精度診断ジョブを進める。標準→厳密の順でバッチ単位のテストコーディングを行い
+    （_render_coding_jobと同じくバッチごとにst.rerun()して中断ボタンに反応できるようにする）、
+    両方完了したら混同ペアを分析し、llm_edit_codebookでコードブック見直し案を作成して
+    result['pending_edit']にセットする（既存の編集案プレビュー・確定/キャンセルの仕組みをそのまま使う）。
+    中断すると診断全体を中止し、それまでの部分結果は使わない（見直し案は作成しない）。
+    """
+    job = st.session_state.diagnostic_job
+
+    if job['phase'] in ('standard', 'strict'):
+        items = job['items']
+        batches = [items[i:i+CODING_BATCH_SIZE] for i in range(0, len(items), CODING_BATCH_SIZE)]
+        total_batches = len(batches)
+        phase_label = '標準' if job['phase'] == 'standard' else '厳密'
+        processed = min(job['batch_index'] * CODING_BATCH_SIZE, len(items))
+
+        st.markdown('#### 🎯 精度診断中')
+        st.progress(job['batch_index'] / total_batches if total_batches else 1.0)
+        st.markdown(f'**{phase_label}でテストコーディング中...（{processed}/{len(items)}件）**')
+        if st.button('⏹ 中断する（診断を中止）', width='stretch'):
+            st.session_state.diagnostic_job = None
+            st.rerun()
+            return
+
+        if job['batch_index'] >= total_batches:
+            if job['phase'] == 'standard':
+                job['phase'] = 'strict'
+                job['batch_index'] = 0
+            else:
+                job['phase'] = 'analyzing'
+            st.rerun()
+            return
+
+        client = make_client('Anthropic', job['api_key'])
+        batch  = batches[job['batch_index']]
+        res = _code_one_batch(client, job['q_name'], job['codes'], batch,
+                               job['coding_model'], [], job['phase'])
+        results_key = 'std_results' if job['phase'] == 'standard' else 'strict_results'
+        job[results_key].extend(res)
+        job['batch_index'] += 1
+        st.rerun()
+        return
+
+    # phase == 'analyzing'
+    st.markdown('#### 🎯 精度診断中')
+    st.markdown('**結果を分析し、コードブック見直し案を作成中...**')
+
+    result = None
+    for h in st.session_state.history:
+        if h['id'] == job['history_id']:
+            result = h['result']
+            break
+
+    if result is not None:
+        top_pairs, pair_examples = _diagnose_confused_pairs(
+            job['std_results'], job['strict_results'], job['items'], top_n=10)
+        if top_pairs:
+            client = make_client('Anthropic', job['api_key'])
+            codes_by_id = {c['code_id']: c for c in job['codes']}
+            instruction = _build_diagnostic_instruction(top_pairs, pair_examples, codes_by_id)
+            proposed = llm_edit_codebook(client, result['codebook'], instruction, job['q_name'])
+            if proposed and proposed.get('categories'):
+                result['pending_edit'] = {
+                    'instruction': f'🎯 精度診断による見直し提案（混同ペア{len(top_pairs)}件を検出）',
+                    'codebook': proposed,
+                }
+            else:
+                result['diagnostic_message'] = '見直し案の作成に失敗しました。再度お試しください。'
+        else:
+            result['diagnostic_message'] = '標準・厳密の間でコードの選択が入れ替わったペアは見つかりませんでした（コードブックは良好な状態です）。'
+
+    st.session_state.diagnostic_job = None
+    st.rerun()
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
@@ -1781,10 +1934,13 @@ def _render_coding_job():
 st.markdown('<p class="main-title">👻 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">アップロードした自由文回答テキストを自動でコーディングし集計します</p>', unsafe_allow_html=True)
 
-# コーディングジョブが進行中は、進捗＋中断ボタンだけを表示してスクリプトを終了する
+# コーディングジョブ・精度診断ジョブが進行中は、進捗＋中断ボタンだけを表示してスクリプトを終了する
 # （サイドバー・結果表示など他のUIは中断可否に関わらず操作させない）。
 if st.session_state.coding_job:
     _render_coding_job()
+    st.stop()
+if st.session_state.diagnostic_job:
+    _render_diagnostic_job()
     st.stop()
 
 # ── サイドバー：設定 ──────────────────────────────
@@ -1885,6 +2041,14 @@ with st.sidebar:
              '見落としを減らします（過剰付与が増える可能性があります）。リスクチェック・回答分類の判定基準には影響しません。'
     )
     coding_strictness = CODING_STRICTNESS_OPTIONS[coding_strictness_label]
+
+    diagnostic_max = max(20, min(300, n_texts)) if n_texts else 300
+    diagnostic_size = st.slider(
+        '🎯 精度診断のテスト件数',
+        min_value=20, max_value=diagnostic_max, value=min(100, diagnostic_max), step=10,
+        help='精度診断（標準・厳密の2種類でテストコーディングし、コードブックの見直し案を作成する機能）で使う件数です。'
+             '通常のコーディング範囲とは別に、少なめの件数で素早く診断する用途を想定しています。'
+    )
 
     st.markdown('**⚠️ リスクチェック（該当有無を検知）**')
     enabled_risks = []
@@ -2288,6 +2452,27 @@ if active_result:
                 )
                 st.rerun()
             st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。実行中は「⏹ 中断する」でそれまでの結果を保存して打ち切れます。')
+    st.divider()
+
+    # ── 精度診断（標準・厳密で試しコーディングし、コード同士の混同を検出してコードブック見直し案を作る） ──
+    diag_message = result.pop('diagnostic_message', None)
+    if diag_message:
+        st.info(diag_message)
+    if pending_edit:
+        st.caption('※ 編集案を確定またはキャンセルしてから精度診断を実行してください。')
+    else:
+        diag_target = min(diagnostic_size, total_items)
+        if st.button(f'🎯 精度診断を実行（{diag_target}件を標準・厳密の両方でテスト）', width='stretch'):
+            _start_diagnostic(
+                api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                diag_target, st.session_state.active_history_id,
+                result.get('coding_model', CODING_MODEL),
+            )
+            st.rerun()
+        st.caption('※ 同じ回答を標準・厳密の両方でテストコーディングし、判定が割れやすいコードペアを検出して、'
+                   'コードブックの見直し案（統合または定義の書き分け）を自動作成します。'
+                   '見直し案は編集案と同じ仕組みで表示され、確定するまでコードブックには反映されません。'
+                   '通常のコーディングとは別に2回分のテストコーディング＋見直し案作成のAPIコストがかかります。')
     st.divider()
 
     # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
