@@ -478,8 +478,11 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
     # 機械的に判定するため、_code_items側で処理しここには含めない）
     llm_answer_types = [o for o in ANSWER_TYPE_OPTIONS if o.get('llm')]
 
+    # 定義文は全文をそのまま渡す（以前は[:25]で先頭25文字に切り詰めていたが、区別のポイントが
+    # それより後ろに書かれている定義が多く、似たコード同士の混同の一因になっていた。コードブックは
+    # systemプロンプト側でキャッシュされるため、全文にしてもコスト増は初回バッチ分のみで軽微）。
     code_list = '\n'.join(
-        f'{c["code_id"]}（{c["cat_name"]}）: {c["code_name"]} / {c["definition"][:25]}'
+        f'{c["code_id"]}（{c["cat_name"]}）: {c["code_name"]} / {c["definition"]}'
         for c in codes
     )
     answer_type_rule = ''
