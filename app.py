@@ -459,6 +459,21 @@ code_idは既存コードと同じC0101形式で採番すること（接頭辞�
     return result.get('new_codes', [])
 
 
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[。！？])')
+
+
+def _split_sentences(text):
+    """
+    テキストを文単位に分割する（句点・感嘆符・疑問符の直後で区切るルールベースの文境界検出。
+    形態素解析＝単語分割ではなく、文の切れ目を見つけるだけなので外部ライブラリは使わない）。
+    末尾に区切り記号が無い断片も1文として扱う。空白のみ・空文字列の断片は除外する。
+    """
+    if not text:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_risks=None,
                     strictness=CODING_STRICTNESS):
     """
@@ -513,23 +528,46 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
 【コード判定基準】コードのテーマに関連する内容であれば、表現が異なっていても幅広く付与してください。文脈から示唆される内容も対象に含めてください。"""
 
     system_prompt = f"""「{q_name}」の回答にコードブックに基づいてコーディングしてください。
+回答は句点等で区切った文ごとに番号を振って渡します。回答全体の文脈を踏まえた上で判断してください
+（1文だけを単独で読むのではなく、前後の文もヒントにしてください）。ただし、コード・センチメントの
+判定結果は文ごとに返してください。
 
 【コードブック】
 {code_list}
 
 【ルール】
-- 1回答に複数コード付与可
-- 該当なしはcodesを空配列
-- sentimentは positive/negative/neutral{answer_type_rule}{risk_rule}{strictness_rule}"""
+- 1文に複数コード付与可。該当なしはcodesを空配列
+- sentimentは文ごとに positive/negative/neutral のいずれか
+- key_sentence_idxには、その回答の中で回答者が最も伝えたいこと・結論と言える文の番号を1つ指定する
+  （該当する文がない、または回答が空の場合は0）{answer_type_rule}{risk_rule}{strictness_rule}"""
 
-    items_text = '\n'.join(f'{x["id"]}: {x["text"]}' for x in items)
+    sentences_by_id = {x['id']: _split_sentences(x['text']) for x in items}
+
+    def _numbered(sentences):
+        if not sentences:
+            return '(本文なし)'
+        return '\n'.join(f'[{i+1}] {s}' for i, s in enumerate(sentences))
+
+    items_text = '\n\n'.join(f'{x["id"]}:\n{_numbered(sentences_by_id[x["id"]])}' for x in items)
     prompt = f"""【回答】
 {items_text}"""
 
-    result_properties = {
-        'id':        {'type': 'string'},
+    sentence_properties = {
+        'idx':       {'type': 'integer'},
+        'sentiment': {'type': 'string', 'enum': ['positive', 'negative', 'neutral']},
         'codes':     {'type': 'array', 'items': {'type': 'string'}},
-        'sentiment': {'type': 'string', 'enum': ['positive','negative','neutral']},
+    }
+    result_properties = {
+        'id': {'type': 'string'},
+        'sentences': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': sentence_properties,
+                'required': ['idx', 'sentiment', 'codes'],
+            },
+        },
+        'key_sentence_idx': {'type': 'integer'},
     }
     for o in llm_answer_types:
         result_properties[o['key']] = {'type': 'boolean'}
@@ -544,7 +582,7 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
                 'items': {
                     'type': 'object',
                     'properties': result_properties,
-                    'required': ['id', 'codes', 'sentiment'] + [o['key'] for o in llm_answer_types],
+                    'required': ['id', 'sentences', 'key_sentence_idx'] + [o['key'] for o in llm_answer_types],
                 }
             }
         },
@@ -552,9 +590,39 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
     }
     result = call_llm(client, prompt, schema, 'Anthropic', model,
                        system=system_prompt, cache_system=True)
-    if result and isinstance(result, dict):
-        return result.get('results', [])
-    return []
+    raw_results = result.get('results', []) if result and isinstance(result, dict) else []
+
+    # 文ごとの判定（sentences）を回答単位のcodes/sentimentに集約し、既存の呼び出し元
+    # （aggregate_results・Excel生成など）が今まで通り動くようにする。集約ルール：
+    # codesは全文の和集合、sentimentは全文が同じ値ならその値、割れていれば'mixed'（混在）。
+    # 文テキスト・結論文（key_sentence）は文番号(idx)から元の文リストを引いて埋め込む
+    # （AIには文番号だけを返させ、文そのものを書き写させない＝原文と完全一致する引用になる）。
+    for r in raw_results:
+        sentences = sentences_by_id.get(r.get('id'), [])
+        sent_list = r.get('sentences', [])
+        for s in sent_list:
+            idx = s.get('idx')
+            s['text'] = sentences[idx - 1] if isinstance(idx, int) and 1 <= idx <= len(sentences) else ''
+
+        all_codes = []
+        for s in sent_list:
+            for cid in s.get('codes', []):
+                if cid not in all_codes:
+                    all_codes.append(cid)
+        r['codes'] = all_codes
+
+        sentiments = {s.get('sentiment') for s in sent_list if s.get('sentiment')}
+        if len(sentiments) == 1:
+            r['sentiment'] = next(iter(sentiments))
+        elif len(sentiments) > 1:
+            r['sentiment'] = 'mixed'
+        else:
+            r['sentiment'] = 'neutral'
+
+        key_idx = r.get('key_sentence_idx')
+        r['key_sentence'] = sentences[key_idx - 1] if isinstance(key_idx, int) and 1 <= key_idx <= len(sentences) else ''
+
+    return raw_results
 
 
 def llm_edit_codebook(client, codebook, instruction, q_name):
@@ -620,7 +688,7 @@ def aggregate_results(codes, results, total, risk_keys=None):
     """
     risk_keys   = risk_keys or []
     code_counts = {c['code_id']: 0 for c in codes}
-    sent_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
+    sent_counts = {'positive': 0, 'negative': 0, 'neutral': 0, 'mixed': 0}
     risk_counts = {k: 0 for k in risk_keys}
     answer_type_counts = {o['key']: 0 for o in ANSWER_TYPE_OPTIONS}
     result_map  = {r['id']: r for r in results}
@@ -858,7 +926,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     # 「特記情報集計」「回答別コーディング結果」のフラグ列（非/不/無/リスク項目）の並びと一致する。
     info_items = (
         [(label, sent_counts[key]) for key, label in
-         [('positive', 'ポジティブ'), ('negative', 'ネガティブ'), ('neutral', 'ニュートラル')]]
+         [('positive', 'ポジティブ'), ('negative', 'ネガティブ'), ('neutral', 'ニュートラル'), ('mixed', '混在')]]
         + [('非該当（コードなし）', unassigned)]
         + [(o['label'], answer_type_counts.get(o['key'], 0)) for o in ANSWER_TYPE_OPTIONS]
         + [(o['label'], risk_counts.get(o['key'], 0)) for o in risk_opts]
@@ -1192,7 +1260,20 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     def _attr_sort_key(it):
         return tuple(str(it.get('attrs', {}).get(k, '')) for k in attr_keys)
 
-    # (順A用のランク, 属性値の並び, 元の出現順, コード情報, 回答item) のリストを作り、非該当は別枠に分ける
+    def _excerpt_for_code(res, cid, fallback_text):
+        """
+        resの文単位データ（sentences、5.1節参照）から、該当コードcidが付与された文だけを
+        抜き出して連結する（原文の一部をそのまま引用するため、要約や言い換えは発生しない）。
+        文単位データが無い場合（旧形式の結果など）は回答全文にフォールバックする。
+        これにより、1回答が複数コードに該当する場合でも、コードごとに関係する箇所だけを
+        表示でき、同じ長文がそのまま何度も繰り返し出てくることを防ぐ。
+        """
+        sentences = res.get('sentences') or []
+        matched = [s.get('text', '') for s in sentences if cid in s.get('codes', []) and s.get('text')]
+        return '／'.join(matched) if matched else fallback_text
+
+    # (順A用のランク, 属性値の並び, 元の出現順, コード情報, 回答item, 該当箇所の抜粋) のリストを作り、
+    # 非該当は別枠に分ける
     coded_rows, unassigned_items = [], []
     for ri, res in enumerate(results):
         it = item_map_full.get(res.get('id'))
@@ -1205,14 +1286,15 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
         for cid in assigned:
             code = code_lookup.get(cid)
             if code:
-                coded_rows.append((code_rank.get(cid, len(codes_sorted_a)), _attr_sort_key(it), ri, code, it))
+                excerpt = _excerpt_for_code(res, cid, it['text'])
+                coded_rows.append((code_rank.get(cid, len(codes_sorted_a)), _attr_sort_key(it), ri, code, it, excerpt))
     # 順A（カテゴリ→コード）を主キーに、属性１・属性２・属性３…の値を副キーとして並べる
     coded_rows.sort(key=lambda x: (x[0], x[1], x[2]))
 
     # 列構成：A列＝カテゴリー/コードの見出し専用（データは持たない）、B列以降が実データ
     MARK_COL = 1
     DATA_START = 2
-    headers = ['カテゴリー名', 'コード名', '回答者ID', 'FA番号', '自由記述'] + attr_keys
+    headers = ['カテゴリー名', 'コード名', '回答者ID', 'FA番号', '自由記述（該当箇所）'] + attr_keys
     hdr_row3 = 4
     hdr_mark = ws3.cell(row=hdr_row3, column=MARK_COL)
     hdr_mark.font = HDR_FONT; hdr_mark.fill = HDR_FILL; hdr_mark.border = BORDER
@@ -1242,7 +1324,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
 
     r = hdr_row3 + 1
     prev_cat = prev_code = None
-    for _, _, _, code, it in coded_rows:
+    for _, _, _, code, it, excerpt in coded_rows:
         cat_id = code['cat_id']
         if cat_id != prev_cat:
             _mark_cell(r, f"■ カテゴリー：{code['cat_name']}", cat_color_full.get(cat_id, '808080'), size=14)
@@ -1252,7 +1334,7 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
             _mark_cell(r, f"▶ コード：{code['code_name']}", cat_color_pale.get(cat_id, 'D9D9D9'), size=12, font_color='000000')
             r += 1
             prev_code = code['code_id']
-        _data_row(r, [code['cat_name'], code['code_name'], it['id'], it.get('fa_no') or '', it['text']]
+        _data_row(r, [code['cat_name'], code['code_name'], it['id'], it.get('fa_no') or '', excerpt]
                   + [it.get('attrs', {}).get(k, '') for k in attr_keys])
         r += 1
 
@@ -1273,6 +1355,62 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
     for ci in range(len(attr_keys)):
         ws3.column_dimensions[get_column_letter(DATA_START+5+ci)].width = 14
     ws3.freeze_panes = f'{get_column_letter(DATA_START)}{hdr_row3+1}'
+
+    # ══════════════════════════════════════════════════
+    # 文単位データシート（1行1文のRAWデータ。他の集計・分析への再利用を想定）
+    # ══════════════════════════════════════════════════
+    ws4 = wb.create_sheet('文単位データ')
+    ws4.sheet_view.showGridLines = False
+
+    ws4.cell(row=1, column=1, value=f'文単位データ：{q_name}').font = Font(
+        name='Meiryo UI', bold=True, size=16, color='2E5C8A')
+    ws4.cell(row=2, column=1,
+             value=f'集計日時: {datetime.now().strftime("%Y/%m/%d %H:%M")}  有効回答数: {total}件').font = Font(
+        name='Meiryo UI', size=10, color='808080')
+    ws4.cell(row=3, column=1,
+             value='※回答を文単位に分割し、文ごとのセンチメント・該当コードをそのまま列挙したRAWデータです。'
+                   '他の集計・分析に再利用する用途を想定しています。').font = Font(
+        name='Meiryo UI', size=9, italic=True, color='808080')
+
+    sent4_headers = ['回答ID', 'FA番号'] + attr_keys + ['文番号', '文テキスト', 'センチメント', '該当コードID', '該当コード名']
+    hdr_row4 = 5
+    for ci, h in enumerate(sent4_headers):
+        c = ws4.cell(row=hdr_row4, column=1+ci, value=h)
+        c.font = HDR_FONT; c.fill = HDR_FILL; c.border = BORDER
+        c.alignment = Alignment(wrap_text=False, vertical='center')
+
+    r4 = hdr_row4 + 1
+    for res in results:
+        it = item_map_full.get(res.get('id'))
+        if not it:
+            continue
+        sentences = res.get('sentences') or []
+        for s in sentences:
+            code_ids   = s.get('codes', [])
+            code_names = [code_lookup[cid]['code_name'] for cid in code_ids if cid in code_lookup]
+            vals = (
+                [it['id'], it.get('fa_no') or '']
+                + [it.get('attrs', {}).get(k, '') for k in attr_keys]
+                + [s.get('idx', ''), s.get('text', ''), s.get('sentiment', ''),
+                   '; '.join(code_ids), '; '.join(code_names)]
+            )
+            for ci, v in enumerate(vals):
+                c = ws4.cell(row=r4, column=1+ci, value=v)
+                c.font = DATA_FONT; c.border = BORDER
+                c.alignment = Alignment(wrap_text=True, vertical='top')
+            r4 += 1
+
+    id_col_count = 2 + len(attr_keys)
+    ws4.column_dimensions[get_column_letter(1)].width = 12  # 回答ID
+    ws4.column_dimensions[get_column_letter(2)].width = 10  # FA番号
+    for ci in range(len(attr_keys)):
+        ws4.column_dimensions[get_column_letter(3+ci)].width = 14
+    ws4.column_dimensions[get_column_letter(id_col_count+1)].width = 8   # 文番号
+    ws4.column_dimensions[get_column_letter(id_col_count+2)].width = 50  # 文テキスト
+    ws4.column_dimensions[get_column_letter(id_col_count+3)].width = 12  # センチメント
+    ws4.column_dimensions[get_column_letter(id_col_count+4)].width = 20  # 該当コードID
+    ws4.column_dimensions[get_column_letter(id_col_count+5)].width = 30  # 該当コード名
+    ws4.freeze_panes = f'A{hdr_row4+1}'
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -2553,6 +2691,7 @@ if active_result:
   <div>😊 <b>ポジティブ</b>　{sent['positive']}件（{_pct(sent['positive'])}）</div>
   <div>😞 <b>ネガティブ</b>　{sent['negative']}件（{_pct(sent['negative'])}）</div>
   <div>😐 <b>ニュートラル</b>　{sent['neutral']}件（{_pct(sent['neutral'])}）</div>
+  <div>🌗 <b>混在</b>　{sent.get('mixed', 0)}件（{_pct(sent.get('mixed', 0))}）</div>
   <div>➖ <b>非該当（コードなし）</b>　{unassigned}件（{_pct(unassigned)}）</div>
 {answer_type_html}{risk_html}</div>
 """, unsafe_allow_html=True)
