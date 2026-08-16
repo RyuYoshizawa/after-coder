@@ -2099,6 +2099,141 @@ def _render_diagnostic_job():
 
     st.session_state.diagnostic_job = None
     st.rerun()
+
+
+def _render_basic_table_tab(result):
+    """
+    「基本集計表」タブ：GT集計表からコードを選び（最大2つ、比較用）、該当する文を一覧表示し、
+    文をひとつ選ぶと元の回答原文（該当箇所を強調）を表示する、ドリルダウン形式の画面。
+    ユーザー提供のレイアウト見本（開発指示用素材/基本集計表.xlsx）に基づく。2026-08-16追加。
+    """
+    gt      = result.get('gt', [])
+    codes   = result.get('codes', [])
+    items   = result.get('items', [])
+    results = result.get('results', [])
+
+    if not gt or not codes:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブでコーディングを実行してください。')
+        return
+
+    item_map = {it['id']: it for it in items}
+    code_by_id = {c['code_id']: c for c in codes}
+
+    # 順A（カテゴリ出現率順→コード出現率順）でコードを並べる。ホームタブのグラフ・Excelと
+    # 同じ並び順・同じ判定材料（_category_color_map）を使うことで、表示が食い違わないようにする。
+    cat_order, _ = _category_color_map(gt, codes)
+    cat_rank     = {cid: i for i, cid in enumerate(cat_order)}
+    gt_count_map = {g['code_id']: g['count'] for g in gt}
+    gt_pct_map   = {g['code_id']: g['pct'] for g in gt}
+    codes_sorted = sorted(
+        codes,
+        key=lambda c: (cat_rank.get(c['cat_id'], len(cat_order)), -gt_count_map.get(c['code_id'], 0))
+    )
+
+    def _on_code_check(code_id):
+        """コード選択は最大2つ（比較用）。3つ目を選ぶと最も古く選んだものが自動的に外れる。"""
+        key = f'basic_code_{code_id}'
+        order = st.session_state.setdefault('basic_code_order', [])
+        if st.session_state.get(key):
+            if code_id not in order:
+                order.append(code_id)
+            while len(order) > 2:
+                oldest = order.pop(0)
+                st.session_state[f'basic_code_{oldest}'] = False
+        elif code_id in order:
+            order.remove(code_id)
+
+    def _on_sentence_check(sel_key):
+        """文選択は常に1件のみ（ドリルダウンが目的のため）。別の文を選ぶと前の選択が自動的に外れる。"""
+        prev = st.session_state.get('basic_selected_sentence')
+        if st.session_state.get(sel_key):
+            if prev and prev != sel_key:
+                st.session_state[prev] = False
+            st.session_state['basic_selected_sentence'] = sel_key
+        elif prev == sel_key:
+            st.session_state['basic_selected_sentence'] = None
+
+    col_left, col_right = st.columns([1, 1.4])
+
+    with col_left:
+        st.markdown('##### GT集計（コードを選択、最大2つ）')
+        prev_cat = None
+        for c in codes_sorted:
+            if c['cat_id'] != prev_cat:
+                st.markdown(f"**■ {c['cat_name']}**")
+                prev_cat = c['cat_id']
+            cnt = gt_count_map.get(c['code_id'], 0)
+            pct = gt_pct_map.get(c['code_id'], 0.0)
+            key = f"basic_code_{c['code_id']}"
+            st.session_state.setdefault(key, False)
+            st.checkbox(
+                f"{c['code_name']}（{pct}%・{cnt}件）",
+                key=key, on_change=_on_code_check, args=(c['code_id'],),
+            )
+
+    selected_code_ids = st.session_state.get('basic_code_order', [])
+
+    with col_right:
+        st.markdown('##### 回答原文')
+        origin_box = st.container(border=True)
+
+        st.markdown('##### コード該当文リスト')
+        if not selected_code_ids:
+            st.caption('左のGT集計表でコードを選択してください（最大2つ、比較用）。')
+
+        selected_display = None  # (回答原文全文, 選択した文テキスト)
+        for i, cid in enumerate(selected_code_ids):
+            code = code_by_id.get(cid)
+            if not code:
+                continue
+            if i > 0:
+                st.markdown('---')
+            st.markdown(f"**▶ {code['code_name']}**")
+            found_any = False
+            for res in results:
+                it = item_map.get(res.get('id'))
+                if not it:
+                    continue
+                sentences = res.get('sentences') or []
+                for s in sentences:
+                    if cid not in s.get('codes', []):
+                        continue
+                    found_any = True
+                    attr_str = '、'.join(f'{k}: {v}' for k, v in it.get('attrs', {}).items() if v)
+                    is_partial = len(sentences) > 1
+                    if is_partial:
+                        # 文が回答全文の一部でしかない場合のみ✓欄を出す。全文と一致する場合は
+                        # 原文を別途表示する意味がないため、✓欄自体を出さない（ユーザー要望）。
+                        sel_key = f"basic_sent_{cid}_{res['id']}_{s.get('idx')}"
+                        st.session_state.setdefault(sel_key, False)
+                        c1, c2 = st.columns([0.06, 0.94])
+                        with c1:
+                            st.checkbox('', key=sel_key, on_change=_on_sentence_check, args=(sel_key,),
+                                        label_visibility='collapsed')
+                        with c2:
+                            st.write(s.get('text', ''))
+                            if attr_str:
+                                st.caption(attr_str)
+                        if st.session_state.get(sel_key):
+                            selected_display = (it['text'], s.get('text', ''))
+                    else:
+                        st.write(s.get('text', ''))
+                        if attr_str:
+                            st.caption(attr_str)
+            if not found_any:
+                st.caption('該当する文がありません。')
+
+        with origin_box:
+            if selected_display:
+                full_text, matched = selected_display
+                if matched and matched in full_text:
+                    shown = full_text.replace(matched, f'**:orange[{matched}]**')
+                else:
+                    shown = full_text
+                st.markdown(shown)
+            else:
+                st.caption('コード該当文リストで部分一致の文（✓欄がある文）を選択すると、'
+                           'ここに回答原文（該当箇所を強調）が表示されます。')
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
@@ -2477,309 +2612,315 @@ if active_result:
     coded_count = result.get('coded_count', 0)
     total_items = result.get('total_items', 0)
 
-    if coded_count == 0:
-        st.success('✅ コードブックの生成が完了しました！')
-    elif coded_count < total_items:
-        st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
-    else:
-        st.success('✅ 分析が完了しました！')
+    tab_home, tab_basic = st.tabs(['🏠 ホーム', '📋 基本集計表'])
 
-    if coded_count > 0:
-        used_model = result.get('coding_model', CODING_MODEL)
-        used_label = next((k for k, v in CODING_MODEL_OPTIONS.items() if v == used_model), used_model)
-        st.caption(f'🧮 この分析のコーディングモデル：{used_label}（作業履歴から他の分析と比較できます）')
+    with tab_home:
 
-    # コスト表示（共通。プロンプトキャッシュの読み込み/書き込み分は呼び出し時点のモデル単価で
-    # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）
-    usage      = result.get('usage', {})
-    inp        = usage.get('input', 0)
-    out        = usage.get('output', 0)
-    cache_read = usage.get('cache_read', 0)
-    cache_new  = usage.get('cache_creation', 0)
-    cost       = usage.get('cost_jpy', 0.0)
-    with st.expander('💰 API使用コスト（参考）'):
-        c1, c2, c3 = st.columns(3)
-        c1.metric('入力トークン', f'{inp:,}')
-        c2.metric('出力トークン', f'{out:,}')
-        c3.metric('推定コスト', f'約 ¥{cost:.0f}')
-        if cache_read or cache_new:
-            c4, c5 = st.columns(2)
-            c4.metric('キャッシュ読込（約1/10単価）', f'{cache_read:,}')
-            c5.metric('キャッシュ書込（約1.25倍単価）', f'{cache_new:,}')
-        st.caption(
-            '※ 1USD=150円換算。コードブック策定はSonnet、コーディングはHaikuの料金に基づく概算です。'
-            'コーディングはコードブックをプロンプトキャッシュしており、2回目以降のバッチはキャッシュ読込分が割安になります。'
-        )
-
-    # ── コードブック（GT数値付き。折りたたまず常時表示、編集直後もその場で最新反映） ──
-    gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
-    st.markdown('#### 📐 コードブック')
-    render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_current')
-
-    # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
-    st.caption(
-        '⚠️ 編集すると現在の内容が置き換わります。コーディング済みの結果には自動反映されません'
-        '（反映するには下の「現在のコードブックでコーディングする」で再度コーディングしてください）。'
-        '保存しておきたい場合は、上の表の右上ツールバーから先にCSVをダウンロードしてください。'
-    )
-    with st.form('edit_instruction_form', clear_on_submit=True):
-        instruction = st.text_input(
-            '編集の指示を入力', label_visibility='collapsed',
-            placeholder='例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜'
-        )
-        submitted = st.form_submit_button('編集案を作成する', width='stretch')
-
-    if submitted and instruction:
-        with st.spinner('編集案を作成中...'):
-            client   = make_client('Anthropic', api_key)
-            proposed = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
-        if proposed:
-            result['pending_edit'] = {'instruction': instruction, 'codebook': proposed}
-            for h in st.session_state.history:
-                if h['id'] == st.session_state.active_history_id:
-                    h['result'] = result
-                    break
-            st.rerun()
+        if coded_count == 0:
+            st.success('✅ コードブックの生成が完了しました！')
+        elif coded_count < total_items:
+            st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
         else:
-            reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-            st.error(f'編集案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+            st.success('✅ 分析が完了しました！')
 
-    # ── 編集案のプレビュー（確定・キャンセルの2段階確認） ──────────
-    pending_edit = result.get('pending_edit')
-    if pending_edit:
-        st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
+        if coded_count > 0:
+            used_model = result.get('coding_model', CODING_MODEL)
+            used_label = next((k for k, v in CODING_MODEL_OPTIONS.items() if v == used_model), used_model)
+            st.caption(f'🧮 この分析のコーディングモデル：{used_label}（作業履歴から他の分析と比較できます）')
 
-        removed, added, changed = _diff_codebook(result['codebook'], pending_edit['codebook'])
-        if removed or added or changed:
-            with st.expander(
-                f'🔍 変更点の詳細（削除{len(removed)}・追加{len(added)}・定義や名称の変更{len(changed)}）',
-                expanded=True,
-            ):
-                for c in removed:
-                    st.markdown(f"- 🗑️ **削除**：{c.get('code_id')}「{c.get('code_name')}」（他のコードへ統合された可能性があります）")
-                for c in added:
-                    st.markdown(f"- ➕ **追加**：{c.get('code_id')}「{c.get('code_name')}」")
-                for o, n in changed:
-                    st.markdown(f"- ✏️ **変更**：{o.get('code_id')}「{o.get('code_name')}」→「{n.get('code_name')}」")
-                    st.caption(f"　旧定義：{o.get('definition', '')}")
-                    st.caption(f"　新定義：{n.get('definition', '')}")
-        else:
-            st.caption('※ コード構成に変更はありませんでした（キーワードなど、表に出づらい細部のみの調整である可能性があります）。')
-
-        render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_pending')
-        pc1, pc2 = st.columns(2)
-        with pc1:
-            if st.button('✅ この内容で確定する', type='primary', width='stretch'):
-                edit_log = result.setdefault(
-                    'edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}]
-                )
-                edit_log.append({'instruction': pending_edit['instruction'], 'codebook': pending_edit['codebook']})
-                result['codebook'] = pending_edit['codebook']
-                result['codes'] = [
-                    {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                    for cat in pending_edit['codebook'].get('categories', [])
-                    for c in cat.get('codes', [])
-                ]
-                del result['pending_edit']
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
-                st.rerun()
-        with pc2:
-            if st.button('❌ キャンセル', width='stretch'):
-                del result['pending_edit']
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
-                st.rerun()
-
-    # ── 編集履歴 ──────────────────────────────────────────
-    edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
-    if len(edit_log) > 1:
-        with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
-            for i, entry in enumerate(edit_log):
-                n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
-                hc1, hc2 = st.columns([4, 1])
-                hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
-                if i != len(edit_log) - 1:
-                    if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
-                        edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
-                        result['codebook'] = entry['codebook']
-                        result['codes'] = [
-                            {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                            for cat in entry['codebook'].get('categories', [])
-                            for c in cat.get('codes', [])
-                        ]
-                        for h in st.session_state.history:
-                            if h['id'] == st.session_state.active_history_id:
-                                h['result'] = result
-                                break
-                        st.rerun()
-
-    st.divider()
-
-    # ── 現在のコードブックでコーディングする（1ボタン。左ナビの「コーディング範囲」で指定した件数を、
-    #     毎回コードブックの最新版で最初からコーディングし直す。コードブック編集後に同じ範囲で試し直す
-    #     ／最終的に「全件コーディング」で確定版を作る、という2つの使い方をこの1ボタンでまかなう。
-    #     「未コーディング分だけ追加」方式は廃止した。古いコードブックで処理済みの回答と新しいコード
-    #     ブックで処理した回答が1つの結果内に混在し、最終成果物としての一貫性が崩れるため） ──
-    if pending_edit:
-        st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
-    else:
-        coding_target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
-        if coding_target == 0:
-            st.caption('※ 左ナビの「コーディング範囲」で件数を指定してからコーディングしてください。')
-        else:
-            if st.button(f'▶ 現在のコードブックでコーディングする（全{coding_target}件）', type='primary', width='stretch'):
-                _start_coding_job(
-                    'recode', api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                    coding_target, st.session_state.active_history_id,
-                    result.get('coding_model', CODING_MODEL), result.get('enabled_risks', []),
-                    result.get('coding_strictness', CODING_STRICTNESS),
-                    reset_usage=True, prior_usage=result.get('usage'),
-                )
-                st.rerun()
-            st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。実行中は「⏹ 中断する」でそれまでの結果を保存して打ち切れます。')
-    st.divider()
-
-    # ── 精度診断（標準・厳密で試しコーディングし、コード同士の混同を検出してコードブック見直し案を作る） ──
-    diag_message = result.pop('diagnostic_message', None)
-    if diag_message:
-        st.info(diag_message)
-    if pending_edit:
-        st.caption('※ 編集案を確定またはキャンセルしてから精度診断を実行してください。')
-    else:
-        diag_target = min(diagnostic_size, total_items)
-        if st.button(f'🎯 精度診断を実行（{diag_target}件を標準・厳密の両方でテスト）', width='stretch'):
-            _start_diagnostic(
-                api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                diag_target, st.session_state.active_history_id,
-                result.get('coding_model', CODING_MODEL),
+        # コスト表示（共通。プロンプトキャッシュの読み込み/書き込み分は呼び出し時点のモデル単価で
+        # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）
+        usage      = result.get('usage', {})
+        inp        = usage.get('input', 0)
+        out        = usage.get('output', 0)
+        cache_read = usage.get('cache_read', 0)
+        cache_new  = usage.get('cache_creation', 0)
+        cost       = usage.get('cost_jpy', 0.0)
+        with st.expander('💰 API使用コスト（参考）'):
+            c1, c2, c3 = st.columns(3)
+            c1.metric('入力トークン', f'{inp:,}')
+            c2.metric('出力トークン', f'{out:,}')
+            c3.metric('推定コスト', f'約 ¥{cost:.0f}')
+            if cache_read or cache_new:
+                c4, c5 = st.columns(2)
+                c4.metric('キャッシュ読込（約1/10単価）', f'{cache_read:,}')
+                c5.metric('キャッシュ書込（約1.25倍単価）', f'{cache_new:,}')
+            st.caption(
+                '※ 1USD=150円換算。コードブック策定はSonnet、コーディングはHaikuの料金に基づく概算です。'
+                'コーディングはコードブックをプロンプトキャッシュしており、2回目以降のバッチはキャッシュ読込分が割安になります。'
             )
-            st.rerun()
-        st.caption('※ 同じ回答を標準・厳密の両方でテストコーディングし、判定が割れやすいコードペアを検出して、'
-                   'コードブックの見直し案（統合または定義の書き分け）を自動作成します。'
-                   '見直し案は編集案と同じ仕組みで表示され、確定するまでコードブックには反映されません。'
-                   '通常のコーディングとは別に2回分のテストコーディング＋見直し案作成のAPIコストがかかります。')
-    st.divider()
 
-    # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
-    if coded_count > 0:
-        st.subheader('📊 コーディング結果')
+        # ── コードブック（GT数値付き。折りたたまず常時表示、編集直後もその場で最新反映） ──
+        gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
+        st.markdown('#### 📐 コードブック')
+        render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_current')
 
-        sent               = result['sent']
-        unassigned         = result.get('unassigned', 0)
-        risk_counts        = result.get('risk_counts', {})
-        result_risks       = result.get('enabled_risks', [])
-        answer_type_counts = result.get('answer_type_counts', {})
-        def _pct(cnt):
-            return f'{cnt/coded_count*100:.1f}%' if coded_count else '0.0%'
-
-        answer_type_icons = {'unclear': '❓', 'unanswered': '⬜'}
-        answer_type_html = ''.join(
-            f"  <div>{answer_type_icons.get(o['key'], '❔')} <b>{o['label']}</b>　"
-            f"{answer_type_counts.get(o['key'], 0)}件（{_pct(answer_type_counts.get(o['key'], 0))}）</div>\n"
-            for o in ANSWER_TYPE_OPTIONS
+        # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
+        st.caption(
+            '⚠️ 編集すると現在の内容が置き換わります。コーディング済みの結果には自動反映されません'
+            '（反映するには下の「現在のコードブックでコーディングする」で再度コーディングしてください）。'
+            '保存しておきたい場合は、上の表の右上ツールバーから先にCSVをダウンロードしてください。'
         )
-        risk_icons = {'claim': '📣', 'personal': '🪪', 'org': '🏢', 'danger': '🚨'}
-        risk_html = ''.join(
-            f"  <div>{risk_icons.get(o['key'], '⚠️')} <b>{o['label']}</b>　"
-            f"{risk_counts.get(o['key'], 0)}件（{_pct(risk_counts.get(o['key'], 0))}）</div>\n"
-            for o in RISK_CHECK_OPTIONS if o['key'] in result_risks
-        )
-        with st.expander('📌 特記情報', expanded=True):
-            st.markdown(f"""
-<div style="display:flex; flex-wrap:nowrap; overflow-x:auto; gap:32px; padding:4px 0;">
-  <div>😊 <b>ポジティブ</b>　{sent['positive']}件（{_pct(sent['positive'])}）</div>
-  <div>😞 <b>ネガティブ</b>　{sent['negative']}件（{_pct(sent['negative'])}）</div>
-  <div>😐 <b>ニュートラル</b>　{sent['neutral']}件（{_pct(sent['neutral'])}）</div>
-  <div>🌗 <b>混在</b>　{sent.get('mixed', 0)}件（{_pct(sent.get('mixed', 0))}）</div>
-  <div>➖ <b>非該当（コードなし）</b>　{unassigned}件（{_pct(unassigned)}）</div>
-{answer_type_html}{risk_html}</div>
-""", unsafe_allow_html=True)
+        with st.form('edit_instruction_form', clear_on_submit=True):
+            instruction = st.text_input(
+                '編集の指示を入力', label_visibility='collapsed',
+                placeholder='例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜'
+            )
+            submitted = st.form_submit_button('編集案を作成する', width='stretch')
+
+        if submitted and instruction:
+            with st.spinner('編集案を作成中...'):
+                client   = make_client('Anthropic', api_key)
+                proposed = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
+            if proposed:
+                result['pending_edit'] = {'instruction': instruction, 'codebook': proposed}
+                for h in st.session_state.history:
+                    if h['id'] == st.session_state.active_history_id:
+                        h['result'] = result
+                        break
+                st.rerun()
+            else:
+                reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+                st.error(f'編集案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+
+        # ── 編集案のプレビュー（確定・キャンセルの2段階確認） ──────────
+        pending_edit = result.get('pending_edit')
+        if pending_edit:
+            st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
+
+            removed, added, changed = _diff_codebook(result['codebook'], pending_edit['codebook'])
+            if removed or added or changed:
+                with st.expander(
+                    f'🔍 変更点の詳細（削除{len(removed)}・追加{len(added)}・定義や名称の変更{len(changed)}）',
+                    expanded=True,
+                ):
+                    for c in removed:
+                        st.markdown(f"- 🗑️ **削除**：{c.get('code_id')}「{c.get('code_name')}」（他のコードへ統合された可能性があります）")
+                    for c in added:
+                        st.markdown(f"- ➕ **追加**：{c.get('code_id')}「{c.get('code_name')}」")
+                    for o, n in changed:
+                        st.markdown(f"- ✏️ **変更**：{o.get('code_id')}「{o.get('code_name')}」→「{n.get('code_name')}」")
+                        st.caption(f"　旧定義：{o.get('definition', '')}")
+                        st.caption(f"　新定義：{n.get('definition', '')}")
+            else:
+                st.caption('※ コード構成に変更はありませんでした（キーワードなど、表に出づらい細部のみの調整である可能性があります）。')
+
+            render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_pending')
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                if st.button('✅ この内容で確定する', type='primary', width='stretch'):
+                    edit_log = result.setdefault(
+                        'edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}]
+                    )
+                    edit_log.append({'instruction': pending_edit['instruction'], 'codebook': pending_edit['codebook']})
+                    result['codebook'] = pending_edit['codebook']
+                    result['codes'] = [
+                        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                        for cat in pending_edit['codebook'].get('categories', [])
+                        for c in cat.get('codes', [])
+                    ]
+                    del result['pending_edit']
+                    for h in st.session_state.history:
+                        if h['id'] == st.session_state.active_history_id:
+                            h['result'] = result
+                            break
+                    st.rerun()
+            with pc2:
+                if st.button('❌ キャンセル', width='stretch'):
+                    del result['pending_edit']
+                    for h in st.session_state.history:
+                        if h['id'] == st.session_state.active_history_id:
+                            h['result'] = result
+                            break
+                    st.rerun()
+
+        # ── 編集履歴 ──────────────────────────────────────────
+        edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
+        if len(edit_log) > 1:
+            with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
+                for i, entry in enumerate(edit_log):
+                    n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
+                    hc1, hc2 = st.columns([4, 1])
+                    hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
+                    if i != len(edit_log) - 1:
+                        if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
+                            edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
+                            result['codebook'] = entry['codebook']
+                            result['codes'] = [
+                                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                                for cat in entry['codebook'].get('categories', [])
+                                for c in cat.get('codes', [])
+                            ]
+                            for h in st.session_state.history:
+                                if h['id'] == st.session_state.active_history_id:
+                                    h['result'] = result
+                                    break
+                            st.rerun()
 
         st.divider()
 
-        gt = result['gt']
-        import pandas as pd
-
-        with st.expander('カテゴリ別集計を表示'):
-            cat_summary = {}
-            for item in gt:
-                cid = item['cat_id']
-                if cid not in cat_summary:
-                    cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
-                cat_summary[cid]['件数'] += item['count']
-            df_cat = pd.DataFrame(list(cat_summary.values()))
-            df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
-            df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
-            st.dataframe(df_cat, width='stretch', hide_index=True)
-
-        st.divider()
-
-        st.markdown('#### 📈 コード別GT集計')
-
-        sort_mode = st.radio(
-            '表示順',
-            ['順A：カテゴリ出現率順→コード出現率順', '順B：コード出現率が多い順'],
-            horizontal=True
-        )
-
-        _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
-        # カテゴリの並び順は、生の出現数合計（cat_total）ではなく、_category_color_mapが
-        # 確定させた順位（cat_rank）で決める。2つのカテゴリの合計が同数タイになった場合、
-        # 生の合計値だけをソートキーにすると「タイの間はコード件数だけで全体を横断比較」して
-        # しまい、同じカテゴリのコード同士が分断されて隣り合わなくなる（色分けが乱れて見える
-        # 不具合の原因）。ランク（整数の順位）を使えばタイでも必ずカテゴリごとに固まる。
-        _cat_rank = {cid: i for i, cid in enumerate(_cat_order)}
-
-        if sort_mode == '順B：コード出現率が多い順':
-            gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
+        # ── 現在のコードブックでコーディングする（1ボタン。左ナビの「コーディング範囲」で指定した件数を、
+        #     毎回コードブックの最新版で最初からコーディングし直す。コードブック編集後に同じ範囲で試し直す
+        #     ／最終的に「全件コーディング」で確定版を作る、という2つの使い方をこの1ボタンでまかなう。
+        #     「未コーディング分だけ追加」方式は廃止した。古いコードブックで処理済みの回答と新しいコード
+        #     ブックで処理した回答が1つの結果内に混在し、最終成果物としての一貫性が崩れるため） ──
+        if pending_edit:
+            st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
         else:
-            gt_sorted = sorted(gt, key=lambda x: (_cat_rank.get(x['cat_id'], len(_cat_order)), -x['count']))
-
-        import plotly.express as px
-        df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
-        df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
-        # 色マップのキーは、df_plot（gt由来）と必ず同じcat_nameソースから作る。
-        # result['codes']（現在のコードブック）から作ると、コードブック編集でカテゴリ名を
-        # 変更した後（gt側は編集前の名前のまま）に名前が食い違い、Plotlyが該当カテゴリの色を
-        # 見つけられず自動配色にフォールバックしてしまう（「グラフの色がたまに乱れる」不具合の原因）。
-        _cat_name_map = {g['cat_id']: g['cat_name'] for g in gt}
-        color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order if cid in _cat_name_map}
-        fig = px.bar(
-            df_plot,
-            x='コード名',
-            y='出現率(%)',
-            color='カテゴリ',
-            category_orders={'コード名': df_plot['コード名'].tolist()},
-            color_discrete_map=color_discrete_map,
-            labels={'出現率(%)': '出現率(%)', 'コード名': ''},
-        )
-        fig.update_layout(
-            xaxis_tickangle=-45,
-            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-            height=500,
-            margin=dict(b=120),
-        )
-        st.plotly_chart(fig, width='stretch')
-
+            coding_target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
+            if coding_target == 0:
+                st.caption('※ 左ナビの「コーディング範囲」で件数を指定してからコーディングしてください。')
+            else:
+                if st.button(f'▶ 現在のコードブックでコーディングする（全{coding_target}件）', type='primary', width='stretch'):
+                    _start_coding_job(
+                        'recode', api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                        coding_target, st.session_state.active_history_id,
+                        result.get('coding_model', CODING_MODEL), result.get('enabled_risks', []),
+                        result.get('coding_strictness', CODING_STRICTNESS),
+                        reset_usage=True, prior_usage=result.get('usage'),
+                    )
+                    st.rerun()
+                st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。実行中は「⏹ 中断する」でそれまでの結果を保存して打ち切れます。')
         st.divider()
 
-        partial_note = '' if coded_count >= total_items else f'（{coded_count}/{total_items}件分）'
-        st.markdown(f'#### 💾 レポートのダウンロード{partial_note}')
-        excel_bytes = create_excel(
-            q_name, gt, sent, coded_count,
-            result['results'], result['items'][:coded_count], result['codes'], unassigned,
-            risk_counts=result.get('risk_counts', {}), enabled_risks=result.get('enabled_risks', []),
-            answer_type_counts=result.get('answer_type_counts', {}),
-        )
-        st.download_button(
-            label='📥 Excelレポートをダウンロード',
-            data=excel_bytes,
-            file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            width='stretch',
-        )
+        # ── 精度診断（標準・厳密で試しコーディングし、コード同士の混同を検出してコードブック見直し案を作る） ──
+        diag_message = result.pop('diagnostic_message', None)
+        if diag_message:
+            st.info(diag_message)
+        if pending_edit:
+            st.caption('※ 編集案を確定またはキャンセルしてから精度診断を実行してください。')
+        else:
+            diag_target = min(diagnostic_size, total_items)
+            if st.button(f'🎯 精度診断を実行（{diag_target}件を標準・厳密の両方でテスト）', width='stretch'):
+                _start_diagnostic(
+                    api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                    diag_target, st.session_state.active_history_id,
+                    result.get('coding_model', CODING_MODEL),
+                )
+                st.rerun()
+            st.caption('※ 同じ回答を標準・厳密の両方でテストコーディングし、判定が割れやすいコードペアを検出して、'
+                       'コードブックの見直し案（統合または定義の書き分け）を自動作成します。'
+                       '見直し案は編集案と同じ仕組みで表示され、確定するまでコードブックには反映されません。'
+                       '通常のコーディングとは別に2回分のテストコーディング＋見直し案作成のAPIコストがかかります。')
+        st.divider()
+
+        # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
+        if coded_count > 0:
+            st.subheader('📊 コーディング結果')
+
+            sent               = result['sent']
+            unassigned         = result.get('unassigned', 0)
+            risk_counts        = result.get('risk_counts', {})
+            result_risks       = result.get('enabled_risks', [])
+            answer_type_counts = result.get('answer_type_counts', {})
+            def _pct(cnt):
+                return f'{cnt/coded_count*100:.1f}%' if coded_count else '0.0%'
+
+            answer_type_icons = {'unclear': '❓', 'unanswered': '⬜'}
+            answer_type_html = ''.join(
+                f"  <div>{answer_type_icons.get(o['key'], '❔')} <b>{o['label']}</b>　"
+                f"{answer_type_counts.get(o['key'], 0)}件（{_pct(answer_type_counts.get(o['key'], 0))}）</div>\n"
+                for o in ANSWER_TYPE_OPTIONS
+            )
+            risk_icons = {'claim': '📣', 'personal': '🪪', 'org': '🏢', 'danger': '🚨'}
+            risk_html = ''.join(
+                f"  <div>{risk_icons.get(o['key'], '⚠️')} <b>{o['label']}</b>　"
+                f"{risk_counts.get(o['key'], 0)}件（{_pct(risk_counts.get(o['key'], 0))}）</div>\n"
+                for o in RISK_CHECK_OPTIONS if o['key'] in result_risks
+            )
+            with st.expander('📌 特記情報', expanded=True):
+                st.markdown(f"""
+    <div style="display:flex; flex-wrap:nowrap; overflow-x:auto; gap:32px; padding:4px 0;">
+      <div>😊 <b>ポジティブ</b>　{sent['positive']}件（{_pct(sent['positive'])}）</div>
+      <div>😞 <b>ネガティブ</b>　{sent['negative']}件（{_pct(sent['negative'])}）</div>
+      <div>😐 <b>ニュートラル</b>　{sent['neutral']}件（{_pct(sent['neutral'])}）</div>
+      <div>🌗 <b>混在</b>　{sent.get('mixed', 0)}件（{_pct(sent.get('mixed', 0))}）</div>
+      <div>➖ <b>非該当（コードなし）</b>　{unassigned}件（{_pct(unassigned)}）</div>
+    {answer_type_html}{risk_html}</div>
+    """, unsafe_allow_html=True)
+
+            st.divider()
+
+            gt = result['gt']
+            import pandas as pd
+
+            with st.expander('カテゴリ別集計を表示'):
+                cat_summary = {}
+                for item in gt:
+                    cid = item['cat_id']
+                    if cid not in cat_summary:
+                        cat_summary[cid] = {'カテゴリID': cid, 'カテゴリ名': item['cat_name'], '件数': 0}
+                    cat_summary[cid]['件数'] += item['count']
+                df_cat = pd.DataFrame(list(cat_summary.values()))
+                df_cat['出現率(%)'] = (df_cat['件数'] / coded_count * 100).round(1)
+                df_cat = df_cat.sort_values('件数', ascending=False).reset_index(drop=True)
+                st.dataframe(df_cat, width='stretch', hide_index=True)
+
+            st.divider()
+
+            st.markdown('#### 📈 コード別GT集計')
+
+            sort_mode = st.radio(
+                '表示順',
+                ['順A：カテゴリ出現率順→コード出現率順', '順B：コード出現率が多い順'],
+                horizontal=True
+            )
+
+            _cat_order, _cat_color_full = _category_color_map(gt, result['codes'])
+            # カテゴリの並び順は、生の出現数合計（cat_total）ではなく、_category_color_mapが
+            # 確定させた順位（cat_rank）で決める。2つのカテゴリの合計が同数タイになった場合、
+            # 生の合計値だけをソートキーにすると「タイの間はコード件数だけで全体を横断比較」して
+            # しまい、同じカテゴリのコード同士が分断されて隣り合わなくなる（色分けが乱れて見える
+            # 不具合の原因）。ランク（整数の順位）を使えばタイでも必ずカテゴリごとに固まる。
+            _cat_rank = {cid: i for i, cid in enumerate(_cat_order)}
+
+            if sort_mode == '順B：コード出現率が多い順':
+                gt_sorted = sorted(gt, key=lambda x: x['count'], reverse=True)
+            else:
+                gt_sorted = sorted(gt, key=lambda x: (_cat_rank.get(x['cat_id'], len(_cat_order)), -x['count']))
+
+            import plotly.express as px
+            df_plot = pd.DataFrame(gt_sorted)[['cat_name','code_name','count','pct']]
+            df_plot.columns = ['カテゴリ','コード名','件数','出現率(%)']
+            # 色マップのキーは、df_plot（gt由来）と必ず同じcat_nameソースから作る。
+            # result['codes']（現在のコードブック）から作ると、コードブック編集でカテゴリ名を
+            # 変更した後（gt側は編集前の名前のまま）に名前が食い違い、Plotlyが該当カテゴリの色を
+            # 見つけられず自動配色にフォールバックしてしまう（「グラフの色がたまに乱れる」不具合の原因）。
+            _cat_name_map = {g['cat_id']: g['cat_name'] for g in gt}
+            color_discrete_map = {_cat_name_map[cid]: f'#{_cat_color_full[cid]}' for cid in _cat_order if cid in _cat_name_map}
+            fig = px.bar(
+                df_plot,
+                x='コード名',
+                y='出現率(%)',
+                color='カテゴリ',
+                category_orders={'コード名': df_plot['コード名'].tolist()},
+                color_discrete_map=color_discrete_map,
+                labels={'出現率(%)': '出現率(%)', 'コード名': ''},
+            )
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                height=500,
+                margin=dict(b=120),
+            )
+            st.plotly_chart(fig, width='stretch')
+
+            st.divider()
+
+            partial_note = '' if coded_count >= total_items else f'（{coded_count}/{total_items}件分）'
+            st.markdown(f'#### 💾 レポートのダウンロード{partial_note}')
+            excel_bytes = create_excel(
+                q_name, gt, sent, coded_count,
+                result['results'], result['items'][:coded_count], result['codes'], unassigned,
+                risk_counts=result.get('risk_counts', {}), enabled_risks=result.get('enabled_risks', []),
+                answer_type_counts=result.get('answer_type_counts', {}),
+            )
+            st.download_button(
+                label='📥 Excelレポートをダウンロード',
+                data=excel_bytes,
+                file_name=f'AfterCoding_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                width='stretch',
+            )
+    with tab_basic:
+        _render_basic_table_tab(result)
