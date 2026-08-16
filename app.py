@@ -592,6 +592,18 @@ def llm_code_batch(client, items, codes, q_name, model=CODING_MODEL, enabled_ris
                        system=system_prompt, cache_system=True)
     raw_results = result.get('results', []) if result and isinstance(result, dict) else []
 
+    # AIが返す各結果のidは信頼せず、返ってきた件数が送った件数と一致する場合は、items（送った
+    # 順序）に基づいて強制的に付け直す。文番号付きの複数行プロンプト（[1] 文...\n[2] 文...）に
+    # 変更して以降、実データで「AIが返すidが元のidと一致せず、無回答判定・自由回答一覧・文単位
+    # データの照合が総崩れになる」不具合が確認された。AIは文字列（英数字ID）を1文字も違わず
+    # 書き写すことより、渡された順序を保つことの方が信頼性が高いという前提に基づく対策
+    # （2026-08-16、ユーザー提供の実データで発覚・修正）。件数が一致しない場合（AIが一部の
+    # 回答を欠落・重複させた場合）は、この付け替えができないため、AIの返したid文字列に頼る
+    # 従来の挙動にフォールバックする。
+    if len(raw_results) == len(items):
+        for item, r in zip(items, raw_results):
+            r['id'] = item['id']
+
     # 文ごとの判定（sentences）を回答単位のcodes/sentimentに集約し、既存の呼び出し元
     # （aggregate_results・Excel生成など）が今まで通り動くようにする。集約ルール：
     # codesは全文の和集合、sentimentは全文が同じ値ならその値、割れていれば'mixed'（混在）。
