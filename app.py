@@ -1262,11 +1262,15 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
 
     def _excerpt_for_code(res, cid, fallback_text):
         """
-        resの文単位データ（sentences、5.1節参照）から、該当コードcidが付与された文だけを
+        resの文単位データ（sentences、5.1.1節参照）から、該当コードcidが付与された文だけを
         抜き出して連結する（原文の一部をそのまま引用するため、要約や言い換えは発生しない）。
         文単位データが無い場合（旧形式の結果など）は回答全文にフォールバックする。
         これにより、1回答が複数コードに該当する場合でも、コードごとに関係する箇所だけを
-        表示でき、同じ長文がそのまま何度も繰り返し出てくることを防ぐ。
+        表示でき、無関係なコードの実例として全文がそのまま出てくることを防ぐ。
+
+        該当文が複数ある場合は全て連結して表示する（1文に絞る案も試したが、同じコードが
+        複数文にまたがるケースでは、経緯や状況の流れが1文だけでは伝わらずかえって分かり
+        にくいというユーザーの判断により、全文連結の方針を維持している）。
         """
         sentences = res.get('sentences') or []
         matched = [s.get('text', '') for s in sentences if cid in s.get('codes', []) and s.get('text')]
