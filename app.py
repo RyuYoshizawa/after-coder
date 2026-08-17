@@ -2337,8 +2337,8 @@ if st.session_state.diagnostic_job:
 
 # ── サイドバー：設定 ──────────────────────────────
 with st.sidebar:
-    st.markdown('# After Coder')
-    st.markdown('*by Marketing Junction*')
+    st.markdown('# アフターコーディング支援ツール After Coder')
+    st.markdown('*KOTONOHA by Marketing Junction*')
     st.caption(f'👤 ログイン中: {st.session_state.username}')
     st.divider()
     st.header('⚙️ 設定')
@@ -2420,7 +2420,7 @@ with st.sidebar:
         index=0,
         help='コーディング（分類作業）に使うモデルを選びます。Haiku 4.5はSonnet 4.6の約1/3の単価です。'
              '精度・価格を比較したい場合は、同じコードブックのまま方式を変えて2回実行し、'
-             '「📜 作業履歴」で結果とコストを見比べてください（1回の分析中でモデルが混在することはありません）。'
+             '「🕒 最近使用したプロジェクト」で結果とコストを見比べてください（1回の分析中でモデルが混在することはありません）。'
     )
     coding_model = CODING_MODEL_OPTIONS[coding_model_label]
 
@@ -2450,19 +2450,10 @@ with st.sidebar:
     st.caption('「不明」「無回答」はチェック不要（常に判定）')
 
     st.divider()
-    st.markdown('**📖 使い方**')
-    st.markdown('''
-1. APIキーと設問名を入力
-2. 分析データの特徴を記入（任意）
-3. テキストファイルをアップロード
-4. 「分析開始」をクリック
-5. 結果を確認してExcelをダウンロード
-    ''')
-
-    st.divider()
-    st.markdown('**📜 作業履歴**')
+    st.markdown('**💾 プロジェクトファイル**')
+    st.markdown('**🕒 最近使用したプロジェクト**')
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-10:]):
+        for h in reversed(st.session_state.history[-3:]):
             ts    = h['timestamp'].strftime('%m/%d %H:%M')
             label = h['q_name'] if len(h['q_name']) <= 18 else h['q_name'][:18] + '…'
             active = h['id'] == st.session_state.active_history_id
@@ -2475,13 +2466,8 @@ with st.sidebar:
                 st.session_state.active_history_id = h['id']
                 st.rerun()
     else:
-        st.caption('まだ分析履歴がありません')
+        st.caption('まだプロジェクトがありません')
 
-    st.divider()
-    st.markdown('**💾 プロジェクトファイル**')
-    st.caption('RAWデータ・コードブック・コーディング結果を1つにまとめて保存し、'
-               '次回はアップロードのやり直しなしで続きから再開できます。'
-               '※この場所は暫定です。今後、画面再構成に合わせて移設予定です。')
     active_result_for_save = next(
         (h['result'] for h in st.session_state.history if h['id'] == st.session_state.active_history_id),
         None
@@ -2746,6 +2732,20 @@ if active_result:
     tab_home, tab_basic = st.tabs(['🏠 ホーム', '📋 基本集計表'])
 
     with tab_home:
+
+        # サイドバー整理（2026-08-19）に伴い、「使い方」「プロジェクトファイルの説明」を
+        # ここへ移設。レイアウトは暫定（移設のみ）で、ホーム画面の見直し時に再調整する。
+        with st.expander('📖 使い方・プロジェクトファイルについて'):
+            st.markdown('''
+1. APIキーと設問名を入力
+2. 分析データの特徴を記入（任意）
+3. テキストファイルをアップロード
+4. 「分析開始」をクリック
+5. 結果を確認してExcelをダウンロード
+            ''')
+            st.caption('RAWデータ・コードブック・コーディング結果を1つにまとめて保存し、'
+                       '次回はアップロードのやり直しなしで続きから再開できます（サイドバー'
+                       '「💾 プロジェクトファイル」）。')
 
         if coded_count == 0:
             st.success('✅ コードブックの生成が完了しました！')
