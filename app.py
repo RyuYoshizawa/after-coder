@@ -2250,11 +2250,22 @@ def _render_basic_table_tab(result):
                     if not it:
                         continue
                     sentences = res.get('sentences') or []
-                    for s in sentences:
-                        if cid not in s.get('codes', []):
-                            continue
-                        found_any = True
-                        _render_sentence_row(cid, res, it, s, len(sentences) > 1)
+                    matched = [s for s in sentences if cid in s.get('codes', [])]
+                    if not matched:
+                        continue
+                    found_any = True
+                    if len(matched) > 1:
+                        # 同一原文内に同じコードの文が複数ある場合、文ごとに分けて表示すると
+                        # 同じ回答者の発言が別々の行に分断されて見えてしまう（ユーザー指摘：
+                        # 2026-08-17）。その場合は原文全体を1行としてまとめて表示する
+                        # （text=原文全体になるため、既存の「原文と完全一致なら✓欄なし」の
+                        # ルールがそのまま適用され、余分な✓欄も出ない）。
+                        merged = {'text': it['text'], 'idx': matched[0].get('idx')}
+                        _render_sentence_row(cid, res, it, merged, is_partial=False)
+                    else:
+                        s = matched[0]
+                        is_partial = s.get('text', '').strip() != it['text'].strip()
+                        _render_sentence_row(cid, res, it, s, is_partial)
                 if not found_any:
                     st.caption('該当する文がありません。')
 
