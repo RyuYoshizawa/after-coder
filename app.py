@@ -2197,7 +2197,9 @@ def _render_basic_table_tab(result):
         text = s.get('text', '')
         line = text
         if attr_str:
-            line += f"  \n<span style='font-size:0.78em; color:#888;'>{attr_str}</span>"
+            # 半角スペースはHTML上で連続すると詰められてしまうため、崩れずに2文字分の
+            # インデントを保てる全角スペースを使う。
+            line += f"  \n<span style='font-size:0.78em; color:#888;'>　　{attr_str}</span>"
 
         # 原文参照（✓欄）の有無に関わらず、常に同じ2カラム構成にしてインデントを揃える
         # （✓欄が無い行だけ左端に寄って見えるという指摘への対応）。✓欄が不要な行は
