@@ -89,6 +89,35 @@ def _items_from_texts(texts):
     return [{'id': f'NO{i+1:03d}', 'text': t, 'fa_no': None, 'attrs': {}} for i, t in enumerate(texts)]
 
 
+PROJECT_FILE_APP_TAG      = 'after_coder_project'
+PROJECT_FILE_FORMAT_VER   = 1
+
+
+def _build_project_file(result):
+    """
+    分析結果一式（RAWデータ・列マッピング・コードブック・コーディング結果を含むresult）を、
+    後で「プロジェクトファイルを開く」から読み込んで再開できるJSON形式に変換する。
+    pending_edit（未確定の編集案）は再開時に混乱を招くだけなので含めない。
+    """
+    payload_result = {k: v for k, v in result.items() if k != 'pending_edit'}
+    return {
+        'app':            PROJECT_FILE_APP_TAG,
+        'format_version': PROJECT_FILE_FORMAT_VER,
+        'saved_at':        datetime.now().isoformat(),
+        'result':          payload_result,
+    }
+
+
+def _load_project_file(payload):
+    """_build_project_fileで作られたJSONを読み込み、historyに積めるresult辞書として復元する。"""
+    if not isinstance(payload, dict) or payload.get('app') != PROJECT_FILE_APP_TAG:
+        raise ValueError('After Coderのプロジェクトファイルではないようです。')
+    result = payload.get('result')
+    if not isinstance(result, dict) or 'codebook' not in result or 'items' not in result:
+        raise ValueError('プロジェクトファイルの内容が不完全です。')
+    return result
+
+
 st.set_page_config(
     page_title='アフターコーディング支援ツール',
     page_icon='📊',
@@ -2443,6 +2472,52 @@ with st.sidebar:
                 st.rerun()
     else:
         st.caption('まだ分析履歴がありません')
+
+    st.divider()
+    st.markdown('**💾 プロジェクトファイル**')
+    st.caption('RAWデータ・コードブック・コーディング結果を1つにまとめて保存し、'
+               '次回はアップロードのやり直しなしで続きから再開できます。'
+               '※この場所は暫定です。今後、画面再構成に合わせて移設予定です。')
+    active_result_for_save = next(
+        (h['result'] for h in st.session_state.history if h['id'] == st.session_state.active_history_id),
+        None
+    )
+    if active_result_for_save:
+        project_payload = _build_project_file(active_result_for_save)
+        st.download_button(
+            '💾 プロジェクトファイルをダウンロード',
+            data=json.dumps(project_payload, ensure_ascii=False, indent=2, default=str),
+            file_name=f'AfterCoderProject_{datetime.now().strftime("%Y%m%d_%H%M")}.json',
+            mime='application/json',
+            width='stretch',
+        )
+    else:
+        st.caption('（保存できる分析結果がまだありません）')
+
+    opened_project_file = st.file_uploader(
+        '📂 プロジェクトファイルを開く', type=['json'], key='project_file_uploader',
+        help='以前ダウンロードしたプロジェクトファイル（JSON）を読み込み、保存時点の状態から再開します。'
+    )
+    if opened_project_file is not None:
+        if st.button('📂 この内容で開く', width='stretch', key='open_project_file_btn'):
+            try:
+                loaded_payload = json.loads(opened_project_file.read().decode('utf-8'))
+                loaded_result  = _load_project_file(loaded_payload)
+            except Exception as e:
+                st.error(f'プロジェクトファイルの読み込みに失敗しました: {e}')
+            else:
+                st.session_state.history_counter += 1
+                hist_id = st.session_state.history_counter
+                st.session_state.history.append({
+                    'id':        hist_id,
+                    'q_name':    loaded_result.get('q_name', ''),
+                    'timestamp': datetime.now(),
+                    'result':    loaded_result,
+                })
+                st.session_state.history = st.session_state.history[-10:]
+                st.session_state.active_history_id = hist_id
+                st.success('✅ プロジェクトファイルを読み込みました')
+                st.rerun()
 
     st.divider()
     if st.button('🔄 設定をリセット（新しい分析用）', width='stretch',
