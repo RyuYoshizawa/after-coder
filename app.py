@@ -2259,11 +2259,13 @@ def _render_basic_table_tab(result):
                     if len(matched) > 1:
                         # 同一原文内に同じコードの文が複数ある場合、文ごとに分けて表示すると
                         # 同じ回答者の発言が別々の行に分断されて見えてしまう（ユーザー指摘：
-                        # 2026-08-17）。その場合は原文全体を1行としてまとめて表示する
-                        # （text=原文全体になるため、既存の「原文と完全一致なら✓欄なし」の
-                        # ルールがそのまま適用され、余分な✓欄も出ない）。
-                        merged = {'text': it['text'], 'idx': matched[0].get('idx')}
-                        _render_sentence_row(cid, res, it, merged, is_partial=False)
+                        # 2026-08-17）。原文全体をまとめて表示する案も一度試したが、原文の
+                        # 表示率が上がりすぎるという指摘を受け、自由回答一覧の`_excerpt_for_code`
+                        # と同じ方針（該当する文だけを「／」で連結）に統一した。
+                        joined = '／'.join(s.get('text', '') for s in matched if s.get('text'))
+                        merged = {'text': joined, 'idx': matched[0].get('idx')}
+                        is_partial = joined.strip() != it['text'].strip()
+                        _render_sentence_row(cid, res, it, merged, is_partial)
                     else:
                         s = matched[0]
                         is_partial = s.get('text', '').strip() != it['text'].strip()
@@ -2274,10 +2276,12 @@ def _render_basic_table_tab(result):
         with origin_box:
             if selected_display:
                 full_text, matched = selected_display
-                if matched and matched in full_text:
-                    shown = full_text.replace(matched, f'**:orange[{matched}]**')
-                else:
-                    shown = full_text
+                # 複数文が「／」で連結されている場合（同一原文内の同コード文をまとめた行）は、
+                # 連結文字列そのままでは原文中に一致しないため、文ごとに分けて個別に強調する。
+                shown = full_text
+                for part in matched.split('／'):
+                    if part and part in shown:
+                        shown = shown.replace(part, f'**:orange[{part}]**')
                 st.markdown(shown)
             else:
                 st.caption('コード該当文リストで部分一致の文（✓欄がある文）を選択すると、'
