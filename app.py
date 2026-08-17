@@ -140,20 +140,24 @@ st.markdown("""
 # 認証
 # ══════════════════════════════════════════════════
 
-USERS = {
-    'starangler': 'QWEp12a23#',
-    'mjguest': 'Amazonet1997',
-    'KonomiSenda': 'Amazonet3944',
-    'KunikoOkazaki': 'Mj3944',
-}
-ADMIN_USERNAME = 'admin'
-ADMIN_PASSWORD = 'admin_pass_2026'  # 本番運用前に変更してください
-
-
 def authenticate(username, password):
-    if username == ADMIN_USERNAME:
-        return password == ADMIN_PASSWORD
-    return USERS.get(username) == password
+    """
+    ユーザーID・パスワードはコードに直接書かず、st.secretsから読む。
+    ローカルは.streamlit/secrets.toml（Git管理外）、本番はStreamlit Community Cloudの
+    アプリ設定「Secrets」に、以下の形式で設定する。
+        admin_username = "admin"
+        admin_password = "..."
+        [users]
+        someuser = "..."
+    secrets.toml自体が無い場合や該当キーが無い場合はNone/空辞書扱いとなり、認証は常に失敗する
+    （＝資格情報を設定しない限りログインできない、フェイルセーフな挙動）。
+    """
+    admin_username = st.secrets.get('admin_username', 'admin')
+    admin_password = st.secrets.get('admin_password')
+    if username == admin_username:
+        return admin_password is not None and password == admin_password
+    users = st.secrets.get('users', {})
+    return users.get(username) == password
 
 
 st.session_state.setdefault('authenticated', False)
