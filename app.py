@@ -2235,15 +2235,15 @@ def _render_basic_table_tab(result):
             code = code_by_id.get(cid)
             if not code:
                 continue
+            # コード見出しは窓の外（左上）に置き、窓内をスクロールしても常に見える位置に固定する。
+            # 配色はGT集計のカテゴリー見出しと同じ「カテゴリーカラーの■■」接頭に統一する。
+            cat_color = cat_color_full.get(code['cat_id'], '808080')
+            st.markdown(
+                f"<span style='color:#{cat_color};'>■■</span> <strong>{code['code_name']}</strong>",
+                unsafe_allow_html=True,
+            )
             box = st.container(height=340, border=True, gap=None)
             with box:
-                cat_color = cat_color_full.get(code['cat_id'], '808080')
-                st.markdown(
-                    f"<div style='background:#{cat_color}; color:#FFFFFF; display:inline-block; "
-                    f"padding:2px 10px; border-radius:4px; font-weight:bold; margin-bottom:6px;'>"
-                    f"▶ {code['code_name']}</div>",
-                    unsafe_allow_html=True,
-                )
                 found_any = False
                 for res in results:
                     it = item_map.get(res.get('id'))
