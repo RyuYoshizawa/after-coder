@@ -130,6 +130,9 @@ st.markdown("""
 <style>
 .main-title { font-size: 28px; font-weight: bold; color: #2E5C8A; margin-bottom: 0; }
 .sub-title  { font-size: 14px; color: #666; margin-bottom: 24px; }
+.sidebar-title-wrap { margin-top: -20px; }
+.sidebar-title-jp   { font-size: 15px; font-weight: bold; color: #2E5C8A; margin: 0; white-space: nowrap; }
+.sidebar-title-en   { font-size: 20px; font-weight: bold; color: #2E5C8A; margin: 2px 0 0 0; }
 .step-label { font-size: 13px; font-weight: bold; color: #2E5C8A; }
 .result-box { background: #f8f9fa; border-radius: 8px; padding: 16px; margin: 8px 0; }
 </style>
@@ -2337,7 +2340,13 @@ if st.session_state.diagnostic_job:
 
 # ── サイドバー：設定 ──────────────────────────────
 with st.sidebar:
-    st.markdown('# アフターコーディング支援ツール After Coder')
+    st.markdown(
+        "<div class='sidebar-title-wrap'>"
+        "<p class='sidebar-title-jp'>アフターコーディング支援ツール</p>"
+        "<p class='sidebar-title-en'>After Coder</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     st.markdown('*KOTONOHA by Marketing Junction*')
     st.caption(f'👤 ログイン中: {st.session_state.username}')
     st.divider()
