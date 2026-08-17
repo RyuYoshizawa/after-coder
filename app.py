@@ -2133,7 +2133,8 @@ def _render_basic_table_tab(result):
 
     # 順A（カテゴリ出現率順→コード出現率順）でコードを並べる。ホームタブのグラフ・Excelと
     # 同じ並び順・同じ判定材料（_category_color_map）を使うことで、表示が食い違わないようにする。
-    cat_order, _ = _category_color_map(gt, codes)
+    # 配色（cat_color_full）も同じ関数から取り、GT集計の■■・コード見出しバッジに使う。
+    cat_order, cat_color_full = _category_color_map(gt, codes)
     cat_rank     = {cid: i for i, cid in enumerate(cat_order)}
     gt_count_map = {g['code_id']: g['count'] for g in gt}
     gt_pct_map   = {g['code_id']: g['pct'] for g in gt}
@@ -2172,7 +2173,11 @@ def _render_basic_table_tab(result):
         prev_cat = None
         for c in codes_sorted:
             if c['cat_id'] != prev_cat:
-                st.markdown(f"**■ {c['cat_name']}**")
+                cat_color = cat_color_full.get(c['cat_id'], '808080')
+                st.markdown(
+                    f"<span style='color:#{cat_color};'>■■</span> <strong>{c['cat_name']}</strong>",
+                    unsafe_allow_html=True,
+                )
                 prev_cat = c['cat_id']
             cnt = gt_count_map.get(c['code_id'], 0)
             pct = gt_pct_map.get(c['code_id'], 0.0)
@@ -2185,6 +2190,35 @@ def _render_basic_table_tab(result):
 
     selected_code_ids = st.session_state.get('basic_code_order', [])
 
+    # コード該当文リストの1文分の表示（本文＋属性を1つのmarkdown要素にまとめて行間を詰める）
+    def _render_sentence_row(cid, res, it, s, is_partial):
+        nonlocal selected_display
+        attr_str = '、'.join(f'{k}: {v}' for k, v in it.get('attrs', {}).items() if v)
+        text = s.get('text', '')
+        line = text
+        if attr_str:
+            line += f"  \n<span style='font-size:0.78em; color:#888;'>{attr_str}</span>"
+
+        # 原文参照（✓欄）の有無に関わらず、常に同じ2カラム構成にしてインデントを揃える
+        # （✓欄が無い行だけ左端に寄って見えるという指摘への対応）。✓欄が不要な行は
+        # 左カラムに何も置かず空白のまま残す。
+        c1, c2 = st.columns([0.06, 0.94], gap=None, vertical_alignment='top')
+        if is_partial:
+            sel_key = f"basic_sent_{cid}_{res['id']}_{s.get('idx')}"
+            st.session_state.setdefault(sel_key, False)
+            with c1:
+                st.checkbox('', key=sel_key, on_change=_on_sentence_check, args=(sel_key,),
+                            label_visibility='collapsed')
+            with c2:
+                st.markdown(line, unsafe_allow_html=True)
+            if st.session_state.get(sel_key):
+                selected_display = (it['text'], text)
+        else:
+            # 文が回答全文と完全に一致する場合は、原文を別途表示する意味が無いため✓欄自体を
+            # 出さない（左カラムは空のままでインデントだけ揃える）。
+            with c2:
+                st.markdown(line, unsafe_allow_html=True)
+
     with col_right:
         st.markdown('##### 回答原文')
         origin_box = st.container(border=True)
@@ -2194,46 +2228,35 @@ def _render_basic_table_tab(result):
             st.caption('左のGT集計表でコードを選択してください（最大2つ、比較用）。')
 
         selected_display = None  # (回答原文全文, 選択した文テキスト)
-        for i, cid in enumerate(selected_code_ids):
+        # 2コード選択時は、それぞれ独立した固定高さ・スクロール可能な窓に分けて上下に表示する
+        # （比較のために2コードまで選べるが、片方の該当文が多いともう片方が下に押し流されて
+        # 比較しにくいという指摘への対応）。
+        for cid in selected_code_ids:
             code = code_by_id.get(cid)
             if not code:
                 continue
-            if i > 0:
-                st.markdown('---')
-            st.markdown(f"**▶ {code['code_name']}**")
-            found_any = False
-            for res in results:
-                it = item_map.get(res.get('id'))
-                if not it:
-                    continue
-                sentences = res.get('sentences') or []
-                for s in sentences:
-                    if cid not in s.get('codes', []):
+            box = st.container(height=340, border=True, gap=None)
+            with box:
+                cat_color = cat_color_full.get(code['cat_id'], '808080')
+                st.markdown(
+                    f"<div style='background:#{cat_color}; color:#FFFFFF; display:inline-block; "
+                    f"padding:2px 10px; border-radius:4px; font-weight:bold; margin-bottom:6px;'>"
+                    f"▶ {code['code_name']}</div>",
+                    unsafe_allow_html=True,
+                )
+                found_any = False
+                for res in results:
+                    it = item_map.get(res.get('id'))
+                    if not it:
                         continue
-                    found_any = True
-                    attr_str = '、'.join(f'{k}: {v}' for k, v in it.get('attrs', {}).items() if v)
-                    is_partial = len(sentences) > 1
-                    if is_partial:
-                        # 文が回答全文の一部でしかない場合のみ✓欄を出す。全文と一致する場合は
-                        # 原文を別途表示する意味がないため、✓欄自体を出さない（ユーザー要望）。
-                        sel_key = f"basic_sent_{cid}_{res['id']}_{s.get('idx')}"
-                        st.session_state.setdefault(sel_key, False)
-                        c1, c2 = st.columns([0.06, 0.94])
-                        with c1:
-                            st.checkbox('', key=sel_key, on_change=_on_sentence_check, args=(sel_key,),
-                                        label_visibility='collapsed')
-                        with c2:
-                            st.write(s.get('text', ''))
-                            if attr_str:
-                                st.caption(attr_str)
-                        if st.session_state.get(sel_key):
-                            selected_display = (it['text'], s.get('text', ''))
-                    else:
-                        st.write(s.get('text', ''))
-                        if attr_str:
-                            st.caption(attr_str)
-            if not found_any:
-                st.caption('該当する文がありません。')
+                    sentences = res.get('sentences') or []
+                    for s in sentences:
+                        if cid not in s.get('codes', []):
+                            continue
+                        found_any = True
+                        _render_sentence_row(cid, res, it, s, len(sentences) > 1)
+                if not found_any:
+                    st.caption('該当する文がありません。')
 
         with origin_box:
             if selected_display:
