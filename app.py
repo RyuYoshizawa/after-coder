@@ -130,9 +130,9 @@ st.markdown("""
 <style>
 .main-title { font-size: 28px; font-weight: bold; color: #2E5C8A; margin-bottom: 0; }
 .sub-title  { font-size: 14px; color: #666; margin-bottom: 24px; }
-.sidebar-title-wrap { margin-top: -20px; }
-.sidebar-title-jp   { font-size: 15px; font-weight: bold; color: #2E5C8A; margin: 0; white-space: nowrap; }
-.sidebar-title-en   { font-size: 20px; font-weight: bold; color: #2E5C8A; margin: 2px 0 0 0; }
+.sidebar-title-wrap { margin-top: -10px; }
+.sidebar-title-jp   { font-size: 15px; font-weight: bold; color: #FFFFFF; margin: 0; white-space: nowrap; }
+.sidebar-title-en   { font-size: 40px; font-weight: bold; color: #72C6EF; margin: 2px 0 0 0; }
 .step-label { font-size: 13px; font-weight: bold; color: #2E5C8A; }
 .result-box { background: #f8f9fa; border-radius: 8px; padding: 16px; margin: 8px 0; }
 </style>
