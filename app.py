@@ -5,6 +5,7 @@ Streamlit Webアプリ
 
 import streamlit as st
 import anthropic
+import copy
 import hashlib
 import json
 import re
@@ -84,6 +85,15 @@ def _category_color_map(gt, codes):
     return cat_order, cat_color_full
 
 
+def _lighten_hex(hex_color, factor=0.65):
+    """指定した割合(0〜1)だけ白に近づけた淡い色を返す（Excel出力・バブル図で共通利用）。"""
+    r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
+    r = round(r + (255 - r) * factor)
+    g = round(g + (255 - g) * factor)
+    b = round(b + (255 - b) * factor)
+    return f'{r:02X}{g:02X}{b:02X}'
+
+
 def _items_from_texts(texts):
     """1行1回答のプレーンテキスト入力を、Excel入力と同じitems形式に揃える（fa_no・attrsは空）。"""
     return [{'id': f'NO{i+1:03d}', 'text': t, 'fa_no': None, 'attrs': {}} for i, t in enumerate(texts)]
@@ -135,6 +145,7 @@ st.markdown("""
 .sidebar-title-en   { font-size: 40px !important; font-weight: bold; color: #72C6EF; margin: 2px 0 0 0; }
 .step-label { font-size: 13px; font-weight: bold; color: #2E5C8A; }
 .result-box { background: #f8f9fa; border-radius: 8px; padding: 16px; margin: 8px 0; }
+div[data-testid="stMainBlockContainer"] { padding-top: 2rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -725,6 +736,157 @@ def llm_edit_codebook(client, codebook, instruction, q_name):
         'required': ['categories'],
     }
     return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
+
+
+_PROPOSED_CODE_SCHEMA_PROPS = {
+    'code_name':  {'type': 'string'},
+    'definition': {'type': 'string'},
+    'keywords':   {'type': 'array', 'items': {'type': 'string'}},
+}
+
+
+def llm_propose_merge(client, code_a, code_b, q_name):
+    """
+    統合候補の2コードの内容だけをもとに、統合後の1コード（名称・定義・キーワード）を提案する。
+    llm_edit_codebookと違い、コードブック全体は編集せず、統合後の1コードの中身のみを返す
+    （2026-08-19、コードブック編集タブ③の仕様変更：コード単位でユーザーが内容を確認・編集
+    してから個別に採用できるようにするため）。
+    """
+    prompt = f"""「{q_name}」の自由回答コーディングで使っている、以下の2つのコードを1つに統合してください。
+
+【コード1】
+名称：{code_a['code_name']}
+定義：{code_a.get('definition', '')}
+
+【コード2】
+名称：{code_b['code_name']}
+定義：{code_b.get('definition', '')}
+
+【ルール】
+- 両方の内容を包含する、統合後のコード名・定義を1つ作成する
+- 定義は元の2つの定義の要点を踏まえ、簡潔かつ具体的にする"""
+
+    schema = {
+        'type': 'object',
+        'properties': _PROPOSED_CODE_SCHEMA_PROPS,
+        'required': ['code_name', 'definition'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
+
+
+def llm_propose_split(client, code, q_name):
+    """
+    分割候補の1コードの内容だけをもとに、分割後の2コード（名称・定義・キーワード）を提案する。
+    llm_propose_mergeと対になる関数（2026-08-19追加）。
+    """
+    prompt = f"""「{q_name}」の自由回答コーディングで使っている、以下のコードは範囲が広すぎるため、
+内容に応じて2つの具体的なコードに分割してください。
+
+【分割対象のコード】
+名称：{code['code_name']}
+定義：{code.get('definition', '')}
+
+【ルール】
+- 元のコードがカバーしていた内容を、過不足なく2つに分ける
+- それぞれに適切なコード名・定義を付ける"""
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'codes': {
+                'type': 'array',
+                'items': {'type': 'object', 'properties': _PROPOSED_CODE_SCHEMA_PROPS,
+                          'required': ['code_name', 'definition']},
+                'minItems': 2, 'maxItems': 2,
+            }
+        },
+        'required': ['codes'],
+    }
+    return call_llm(client, prompt, schema, 'Anthropic', CODEBOOK_MODEL)
+
+
+def _next_code_id(codebook, cat_id, extra_taken=()):
+    """指定カテゴリ内で使われていない次のコードID（C0101形式）を採番する。
+    同じ採用操作で複数の新コードを同時に作る場合（分割の2件など）は、直前に採番した
+    コードIDの番号部分をextra_takenに渡すことで衝突を避ける。"""
+    cat_num = cat_id[3:] if cat_id and cat_id.startswith('CAT') else '01'
+    nums = [int(x) for x in extra_taken]
+    for cat in codebook.get('categories', []):
+        if cat.get('cat_id') == cat_id:
+            for c in cat.get('codes', []):
+                cid = c.get('code_id', '')
+                if len(cid) >= 5 and cid[1:3] == cat_num:
+                    try:
+                        nums.append(int(cid[3:5]))
+                    except ValueError:
+                        pass
+    return f'C{cat_num}{max(nums, default=0) + 1:02d}'
+
+
+def _apply_staged_changes(result, staged_changes):
+    """
+    「📝 コードブックを書き換える」ボタンの処理。統合・分割候補の「採用する」は、この関数が
+    呼ばれるまでコードブックを一切書き換えない（2026-08-19、仕様変更）。
+    以前は候補ごとに採用と同時にコードブックへ即時反映していたが、そのたびにコードブック
+    バージョン（edit_logの件数）が進み、他の未処理の候補が「候補作成後にコードブックが
+    変わった」と判定されて軒並み使用不可になってしまう不具合があった（ユーザー報告：
+    「統合作業を行ったあとに分割作業を行うと使用不可になり、作業が進まない」）。
+    そこで「採用する」は変更内容をstaged_changes（result['pending_codebook_changes']）に
+    積むだけにし、実際の書き換えはこの関数を呼ぶ「コードブックを書き換える」ボタンを
+    押した時点でまとめて1回だけ行うようにした。これにより、書き換えるまでは
+    codebook_versionが進まず、複数の統合・分割を続けて採用してから最後にまとめて
+    反映できる。
+
+    staged_changesは1件ずつ順番に適用する（同じカテゴリに複数件追加される場合でも、
+    _next_code_idを直前までの適用結果に対して計算し直すため、コードIDが衝突しない）。
+    適用前に、新しく追加されるコード名どうし、および削除されない既存コードとの重複が
+    無いかを検証する（ユーザー要望：「コード名の重複などはこの段階でチェックしたら」）。
+    重複がある場合は何も変更せず、(None, 重複名のリスト) を返す。
+    成功時は (新しいcodebook, []) を返す。
+    """
+    new_codebook = copy.deepcopy(result['codebook'])
+
+    all_remove_ids = set()
+    for chg in staged_changes:
+        all_remove_ids.update(chg['remove_ids'])
+    existing_names = {
+        c['code_name'] for cat in new_codebook.get('categories', []) for c in cat.get('codes', [])
+        if c['code_id'] not in all_remove_ids
+    }
+    seen, dupes = set(), set()
+    for chg in staged_changes:
+        for nc in chg['new_codes']:
+            name = nc['code_name']
+            if name in existing_names or name in seen:
+                dupes.add(name)
+            seen.add(name)
+    if dupes:
+        return None, sorted(dupes)
+
+    edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
+    for chg in staged_changes:
+        for cat in new_codebook.get('categories', []):
+            cat['codes'] = [c for c in cat.get('codes', []) if c['code_id'] not in chg['remove_ids']]
+        taken, add_codes = [], []
+        for nc in chg['new_codes']:
+            cid = _next_code_id(new_codebook, chg['target_cat_id'], extra_taken=taken)
+            taken.append(cid[3:5])
+            add_codes.append({**nc, 'code_id': cid})
+        for cat in new_codebook.get('categories', []):
+            if cat.get('cat_id') == chg['target_cat_id']:
+                cat['codes'].extend(add_codes)
+                break
+        edit_log.append({'instruction': chg['label'], 'codebook': copy.deepcopy(new_codebook)})
+
+    result['codebook'] = new_codebook
+    result['codes'] = [
+        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+        for cat in new_codebook.get('categories', [])
+        for c in cat.get('codes', [])
+    ]
+    return new_codebook, []
+
+
 # ══════════════════════════════════════════════════
 # 集計・Excel出力関数
 # ══════════════════════════════════════════════════
@@ -916,14 +1078,6 @@ def create_excel(q_name, gt, sent_counts, total, results, items, codes, unassign
 
     # カテゴリ別カラー：画面の縦棒グラフ（5.4節）と同じ色を、カテゴリ出現率の多い順に割り当てる。
     # 「中間カテゴリID」行・コード列見出し行はフル彩度、他の行はその淡色版にする。
-    def _lighten_hex(hex_color, factor=0.65):
-        """指定した割合(0〜1)だけ白に近づけた淡い色を返す"""
-        r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
-        r = round(r + (255 - r) * factor)
-        g = round(g + (255 - g) * factor)
-        b = round(b + (255 - b) * factor)
-        return f'{r:02X}{g:02X}{b:02X}'
-
     cat_order, cat_color_full = _category_color_map(gt, codes)
     cat_color_pale = {cid: _lighten_hex(col) for cid, col in cat_color_full.items()}
     cat_name_map   = {c['cat_id']: c['cat_name'] for c in codes}
@@ -1557,7 +1711,7 @@ def _build_codebook_b(client, all_items, max_codes, q_name, data_context, progre
 
 
 def _topics_cache_key(all_items, q_name, data_context):
-    """方式Cのキャッシュキー。回答内容・設問名・分析データの特徴が同じなら同一キーになる（回答順序は無視）"""
+    """方式Cのキャッシュキー。回答内容・プロジェクト名・分析データの特徴が同じなら同一キーになる（回答順序は無視）"""
     texts = sorted(x['text'] for x in all_items)
     src = q_name + '␟' + data_context + '␟' + '␞'.join(texts)
     return hashlib.sha256(src.encode('utf-8')).hexdigest()
@@ -1683,7 +1837,7 @@ def _build_codebook_c(client, all_items, max_codes, q_name, data_context, progre
     Stage1: 全体のratio割合をランダム抽出して主題抽出→統合し初期コードブックを作成
     Stage2: 残り（1-ratio）を差分検出（ratio=1.0の場合は残りがないため実施しない）
     ステージ完了ごとの結果はセッション内でキャッシュし、後段の失敗時に前段からの
-    やり直しを避ける（同一データ・設問名・分析データの特徴・ratioの場合のみ再利用）。
+    やり直しを避ける（同一データ・プロジェクト名・分析データの特徴・ratioの場合のみ再利用）。
     さらにStage1内部（主題抽出）はバッチごとにディスクへも進捗を保存しており、
     大量データでStage1の途中にアプリが再起動・セッション切断しても再開できる（詳細は
     `_build_codebook_c_stage1`参照）。
@@ -1772,9 +1926,8 @@ def _generate_codebook_step(client, all_items, max_codes, q_name, data_context, 
     return codebook
 
 
-CODING_SCOPE_OPTIONS = ['コーディングしない（策定のみ）', '100件でコーディング', '200件でコーディング', '全件コーディング']
+CODING_SCOPE_OPTIONS = ['100件でコーディング', '200件でコーディング', '全件コーディング']
 CODING_SCOPE_SIZES   = {
-    'コーディングしない（策定のみ）': 0,
     '100件でコーディング':          100,
     '200件でコーディング':          200,
     '全件コーディング':              None,  # Noneは実行時に全件数へ解決
@@ -2322,12 +2475,1010 @@ def _render_basic_table_tab(result):
             else:
                 st.caption('コード該当文リストで部分一致の文（✓欄がある文）を選択すると、'
                            'ここに回答原文（該当箇所を強調）が表示されます。')
+
+    # ── 統合候補・分割候補（コードブック編集タブへ送る前の一時登録、2026-08-19追加） ──
+    # 実際にLLMが統合・分割を提案する処理は未実装（今後の設計課題）。ここでは候補を集める
+    # ところまでを担う。候補はresult側（プロジェクトごと）に保持し、st.session_state.historyの
+    # 該当エントリへ都度書き戻す（他の編集系機能と同じパターン）。
+    def _save_basic_table_result():
+        for h in st.session_state.history:
+            if h['id'] == st.session_state.active_history_id:
+                h['result'] = result
+                break
+
+    merge_candidates = result.setdefault('merge_candidates', [])
+    split_candidates = result.setdefault('split_candidates', [])
+
+    def _claimed_code_ids():
+        """統合候補・分割候補のどちらかに既に登録されているコードIDの集合（2026-08-19、
+        「片方だけ一致すれば重複登録できてしまう」不具合の指摘を受けて追加）。
+        1つのコードは、統合・分割を問わず同時に1つの候補にしか使えない
+        （同じコードに対して矛盾する編集案―統合と分割の両方など―が並行して
+        作られないようにするための制約。ユーザー判断：「集合的に捉えて現在の
+        コーディング結果の総件数に変化がないように」）。"""
+        claimed = set()
+        for c in merge_candidates:
+            claimed.update(c['code_ids'])
+        for c in split_candidates:
+            claimed.add(c['code_id'])
+        return claimed
+
+    st.divider()
+    reg_c1, reg_c2 = st.columns(2)
+    with reg_c1:
+        claimed = _claimed_code_ids()
+        merge_disabled = (
+            len(selected_code_ids) != 2
+            or any(cid in claimed for cid in selected_code_ids)
+        )
+        if st.button('🔗 統合候補', width='stretch', disabled=merge_disabled,
+                     help='選択中の2コードを「統合候補リスト」に一時登録します（コード2つを選択している時のみ。'
+                          'いずれかのコードが既に統合・分割の候補に使われている場合は選べません）。'):
+            names = [code_by_id[cid]['code_name'] for cid in selected_code_ids if cid in code_by_id]
+            # origin_version：登録した時点のコードブックのバージョン（edit_logの件数）を記録する。
+            # コードブック編集タブ側で、候補作成後にコードブックが変わっていないかの判定に使う
+            # （2026-08-19、コードブック編集タブの設計に合わせて追加）。
+            merge_candidates.append({
+                'code_ids': list(selected_code_ids), 'code_names': names,
+                'origin_version': len(result.get('edit_log', [])),
+            })
+            _save_basic_table_result()
+            st.rerun()
+    with reg_c2:
+        claimed = _claimed_code_ids()
+        split_target = selected_code_ids[0] if len(selected_code_ids) == 1 else None
+        split_disabled = split_target is None or split_target in claimed
+        if st.button('✂️ 分割候補', width='stretch', disabled=split_disabled,
+                     help='選択中の1コードを「分割候補リスト」に一時登録します（コード1つを選択している時のみ。'
+                          'そのコードが既に統合・分割の候補に使われている場合は選べません）。'):
+            split_candidates.append({
+                'code_id': split_target,
+                'code_name': code_by_id.get(split_target, {}).get('code_name', split_target),
+                'origin_version': len(result.get('edit_log', [])),
+            })
+            _save_basic_table_result()
+            st.rerun()
+
+    st.markdown('##### 🔗 統合候補リスト')
+    if not merge_candidates:
+        st.caption('まだ登録された統合候補はありません。')
+    else:
+        for i, cand in enumerate(merge_candidates):
+            mc1, mc2 = st.columns([5, 1])
+            mc1.markdown('　＋　'.join(cand['code_names']))
+            if mc2.button('解除', key=f'merge_cand_release_{i}'):
+                merge_candidates.pop(i)
+                _save_basic_table_result()
+                st.rerun()
+        if st.button('📤 統合候補リストをコードブック編集タブに送る', width='stretch', key='send_merge_candidates'):
+            edit_queue_merge = result.setdefault('edit_queue_merge', [])
+            edit_queue_merge.extend(merge_candidates)
+            result['merge_candidates'] = []
+            _save_basic_table_result()
+            st.rerun()
+
+    st.markdown('##### ✂️ 分割候補リスト')
+    if not split_candidates:
+        st.caption('まだ登録された分割候補はありません。')
+    else:
+        for i, cand in enumerate(split_candidates):
+            sc1, sc2 = st.columns([5, 1])
+            sc1.markdown(cand['code_name'])
+            if sc2.button('解除', key=f'split_cand_release_{i}'):
+                split_candidates.pop(i)
+                _save_basic_table_result()
+                st.rerun()
+        if st.button('📤 分割候補リストをコードブック編集タブに送る', width='stretch', key='send_split_candidates'):
+            edit_queue_split = result.setdefault('edit_queue_split', [])
+            edit_queue_split.extend(split_candidates)
+            result['split_candidates'] = []
+            _save_basic_table_result()
+            st.rerun()
+
+
+def _render_codebook_edit_tab(result, api_key, q_name, diagnostic_size):
+    """
+    「コードブック編集」タブ（2026-08-19新設）。コードブックの編集に関わる機能を1箇所に
+    集約する：①精度診断（標準/厳密比較による見直し提案）②自由チャット編集③基本集計表タブ
+    から送られた統合候補・分割候補の処理。①②はコードブック全体を対象とするAI編集案を
+    共通のpending_editの仕組み（プレビュー＋確定/キャンセルの2段階確認）で扱う。
+    ③は対象コード単位の処理のため独自の仕組みを使う：候補ごとに対象コードの現在の定義を
+    提示し、AIに統合後・分割後のコード案（編集可能）を1件だけ作らせ、候補ごとの
+    「採用する」（対象コードを削除し新コードを追加）／「中止する」（提案を破棄）で
+    即時に確定する（2026-08-19、pending_editの共通プレビューを経由しない専用フローに変更）。
+    ①②の編集後は、効果を確かめるために作業メニューの「🧮 コーディング」で再コーディング
+    する運用を想定している（このタブ自体はコーディングを行わない）。
+    """
+
+    def _save_edit_tab_result():
+        for h in st.session_state.history:
+            if h['id'] == st.session_state.active_history_id:
+                h['result'] = result
+                break
+
+    codebook_version = len(result.get('edit_log', []))
+
+    # ── 現在のコードブック（常時表示、表示専用） ──────────────────────
+    gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
+    st.markdown('#### 📐 現在のコードブック')
+    render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_edit_current')
+    st.divider()
+
+    # ── 編集案のプレビュー（①②③共通、確定・キャンセルの2段階確認） ──────
+    pending_edit = result.get('pending_edit')
+    if pending_edit:
+        st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
+
+        removed, added, changed = _diff_codebook(result['codebook'], pending_edit['codebook'])
+        if removed or added or changed:
+            with st.expander(
+                f'🔍 変更点の詳細（削除{len(removed)}・追加{len(added)}・定義や名称の変更{len(changed)}）',
+                expanded=True,
+            ):
+                for c in removed:
+                    st.markdown(f"- 🗑️ **削除**：{c.get('code_id')}「{c.get('code_name')}」（他のコードへ統合された可能性があります）")
+                for c in added:
+                    st.markdown(f"- ➕ **追加**：{c.get('code_id')}「{c.get('code_name')}」")
+                for o, n in changed:
+                    st.markdown(f"- ✏️ **変更**：{o.get('code_id')}「{o.get('code_name')}」→「{n.get('code_name')}」")
+                    st.caption(f"　旧定義：{o.get('definition', '')}")
+                    st.caption(f"　新定義：{n.get('definition', '')}")
+        else:
+            st.caption('※ コード構成に変更はありませんでした（キーワードなど、表に出づらい細部のみの調整である可能性があります）。')
+
+        render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_edit_pending')
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            if st.button('✅ この内容で確定する', type='primary', width='stretch'):
+                edit_log = result.setdefault(
+                    'edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}]
+                )
+                edit_log.append({'instruction': pending_edit['instruction'], 'codebook': pending_edit['codebook']})
+                result['codebook'] = pending_edit['codebook']
+                result['codes'] = [
+                    {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
+                    for cat in pending_edit['codebook'].get('categories', [])
+                    for c in cat.get('codes', [])
+                ]
+                # ③（統合候補・分割候補）発の提案だった場合は、確定と同時に該当候補をキューから
+                # 取り除く（採用済みなので）。①②発の場合はcandidate_refが無いため何もしない。
+                cand_ref = pending_edit.get('candidate_ref')
+                if cand_ref:
+                    queue_key = 'edit_queue_merge' if cand_ref['list'] == 'merge' else 'edit_queue_split'
+                    queue = result.get(queue_key, [])
+                    if 0 <= cand_ref['index'] < len(queue):
+                        queue.pop(cand_ref['index'])
+                del result['pending_edit']
+                _save_edit_tab_result()
+                st.rerun()
+        with pc2:
+            if st.button('❌ キャンセル', width='stretch'):
+                del result['pending_edit']
+                _save_edit_tab_result()
+                st.rerun()
+        st.divider()
+
+    edit_blocked = pending_edit is not None  # ①②③とも、提案が確定/キャンセルされるまでは新規に作れない
+
+    # ── ① 精度診断（標準・厳密で試しコーディングし、コードの混同を検出して見直し案を作る） ──
+    st.markdown('#### ① 精度診断')
+    diag_message = result.pop('diagnostic_message', None)
+    if diag_message:
+        st.info(diag_message)
+    if edit_blocked:
+        st.caption('※ 上の編集案を確定またはキャンセルしてから精度診断を実行してください。')
+    else:
+        total_items_for_diag = result.get('total_items', 0)
+        diag_target = min(diagnostic_size, total_items_for_diag)
+        if st.button(f'🎯 精度診断を実行（{diag_target}件を標準・厳密の両方でテスト）', width='stretch'):
+            _start_diagnostic(
+                api_key, result.get('q_name', q_name), result['codes'], result['items'],
+                diag_target, st.session_state.active_history_id,
+                result.get('coding_model', CODING_MODEL),
+            )
+            st.rerun()
+        st.caption('※ 同じ回答を標準・厳密の両方でテストコーディングし、判定が割れやすいコードペアを検出して、'
+                   'コードブックの見直し案（統合または定義の書き分け）を自動作成します。'
+                   '見直し案は編集案と同じ仕組みで表示され、確定するまでコードブックには反映されません。'
+                   '通常のコーディングとは別に2回分のテストコーディング＋見直し案作成のAPIコストがかかります。'
+                   '編集を確定したら、効果を確かめるために作業メニューの「🧮 コーディング」で再コーディングしてください。')
+    st.divider()
+
+    # ── ② 自由チャット編集（指示文を入力してAIに編集案を作らせる） ──────
+    st.markdown('#### ② 自由チャット編集')
+    if edit_blocked:
+        st.caption('※ 上の編集案を確定またはキャンセルしてからお試しください。')
+    else:
+        st.caption('統合・改名・再定義・コードの追加や削除など、今あるコードブックの整理を指示できます。'
+                   '生データは読み直さないため、新しい観点でのコード発見はできません'
+                   '（新しい観点が必要な場合は「🏠 ホーム」の作業メニューでコードブックを作り直してください）。')
+        with st.form('edit_instruction_form', clear_on_submit=True):
+            instruction = st.text_input(
+                '編集の指示を入力', label_visibility='collapsed',
+                placeholder='例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜'
+            )
+            submitted = st.form_submit_button('編集案を作成する', width='stretch')
+
+        if submitted and instruction:
+            with st.spinner('編集案を作成中...'):
+                client   = make_client('Anthropic', api_key)
+                proposed = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
+            if proposed:
+                result['pending_edit'] = {'instruction': instruction, 'codebook': proposed}
+                _save_edit_tab_result()
+                st.rerun()
+            else:
+                reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
+                st.error(f'編集案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+        st.caption('編集を確定したら、効果を確かめるために作業メニューの「🧮 コーディング」で再コーディングしてください。')
+    st.divider()
+
+    # ── ③ 統合候補・分割候補の処理（基本集計表タブから送られたコードにAIが定義案を提案） ──
+    st.markdown('#### ③ 統合候補・分割候補の処理')
+    edit_queue_merge     = result.get('edit_queue_merge', [])
+    edit_queue_split     = result.get('edit_queue_split', [])
+    pending_cb_changes   = result.get('pending_codebook_changes', [])
+
+    if not edit_queue_merge and not edit_queue_split and not pending_cb_changes:
+        st.info('「📋 基本集計表」タブの「🔗 統合候補」「✂️ 分割候補」から送られたコードが'
+                'ここに表示されます。')
+        return
+
+    st.caption('「採用する」を押した時点ではコードブックはまだ書き換わりません。統合・分割の作業が'
+               '終わったら、下部の「📝 コードブックを書き換える」でまとめて反映してください'
+               '（2026-08-19、仕様変更：以前は採用と同時に即時反映していたが、そのたびに他の未処理の'
+               '候補が使用不可になり作業が進めにくかったための変更）。'
+               '候補を作った時点からコードブックが変わっている（①②で編集済み、リビルド済み、または'
+               '別の候補を書き換え済み）場合、その候補は使用できません（コードの前提が変わってしまう'
+               'ため）。')
+
+    code_by_id_current = {c['code_id']: c for c in result['codes']}
+
+    st.markdown('##### 🔗 統合候補')
+    if not edit_queue_merge:
+        st.caption('まだありません。')
+    else:
+        for i, cand in enumerate(edit_queue_merge):
+            is_valid = cand.get('origin_version') == codebook_version
+            with st.container(border=True):
+                st.markdown('　＋　'.join(cand['code_names']))
+                if not is_valid:
+                    st.caption('⚠️ 使用不可（登録後にコードブックが変更されています）')
+                else:
+                    code_a = code_by_id_current.get(cand['code_ids'][0])
+                    code_b = code_by_id_current.get(cand['code_ids'][1])
+                    if not code_a or not code_b:
+                        st.caption('⚠️ 対象コードが見つかりません（既に削除された可能性があります）。')
+                    else:
+                        st.markdown(f"**{code_a['code_name']}**")
+                        st.caption(code_a.get('definition') or '（定義なし）')
+                        st.markdown(f"**{code_b['code_name']}**")
+                        st.caption(code_b.get('definition') or '（定義なし）')
+
+                        if edit_blocked:
+                            st.caption('※ 上の編集案（①②）を確定/キャンセル後に')
+                        elif cand.get('proposal') is None:
+                            if st.button('🤖 統合案を作成', key=f'propose_merge_{i}', width='stretch'):
+                                with st.spinner('統合案を作成中...'):
+                                    client = make_client('Anthropic', api_key)
+                                    proposed = llm_propose_merge(client, code_a, code_b, result.get('q_name', q_name))
+                                if proposed:
+                                    cand['proposal'] = proposed
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                                else:
+                                    reason = get_last_error() or '原因不明（AIから有効な提案が返されませんでした）'
+                                    st.error(f'統合案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+                        else:
+                            st.markdown('**統合案**（内容は編集できます）')
+                            new_name = st.text_input(
+                                '統合後のコード名', value=cand['proposal'].get('code_name', ''),
+                                key=f'merge_name_{i}',
+                            )
+                            new_def = st.text_area(
+                                '統合後の定義', value=cand['proposal'].get('definition', ''),
+                                key=f'merge_def_{i}', height=100,
+                            )
+                            ac1, ac2 = st.columns(2)
+                            with ac1:
+                                if st.button('✅ 採用する', type='primary', key=f'adopt_merge_{i}', width='stretch'):
+                                    target_cat_id = code_a.get('cat_id')
+                                    new_code_name = new_name.strip() or cand['proposal'].get('code_name', '')
+                                    staged = result.setdefault('pending_codebook_changes', [])
+                                    staged.append({
+                                        'kind': 'merge',
+                                        'remove_ids': list(cand['code_ids']),
+                                        'target_cat_id': target_cat_id,
+                                        'new_codes': [{
+                                            'code_name':  new_code_name,
+                                            'definition': new_def.strip(),
+                                            'keywords':   cand['proposal'].get('keywords', []),
+                                        }],
+                                        'label': f"「{code_a['code_name']}」と「{code_b['code_name']}」を統合して"
+                                                 f"「{new_code_name}」を作成（統合候補の採用）",
+                                        'source_names': [code_a['code_name'], code_b['code_name']],
+                                    })
+                                    edit_queue_merge.pop(i)
+                                    st.session_state.pop(f'merge_name_{i}', None)
+                                    st.session_state.pop(f'merge_def_{i}', None)
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                            with ac2:
+                                if st.button('❌ 中止する', key=f'cancel_merge_{i}', width='stretch'):
+                                    cand['proposal'] = None
+                                    st.session_state.pop(f'merge_name_{i}', None)
+                                    st.session_state.pop(f'merge_def_{i}', None)
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                if st.button('候補から削除', key=f'remove_merge_{i}'):
+                    edit_queue_merge.pop(i)
+                    _save_edit_tab_result()
+                    st.rerun()
+
+    st.markdown('##### ✂️ 分割候補')
+    if not edit_queue_split:
+        st.caption('まだありません。')
+    else:
+        for i, cand in enumerate(edit_queue_split):
+            is_valid = cand.get('origin_version') == codebook_version
+            with st.container(border=True):
+                st.markdown(cand['code_name'])
+                if not is_valid:
+                    st.caption('⚠️ 使用不可（登録後にコードブックが変更されています）')
+                else:
+                    code_x = code_by_id_current.get(cand['code_id'])
+                    if not code_x:
+                        st.caption('⚠️ 対象コードが見つかりません（既に削除された可能性があります）。')
+                    else:
+                        st.markdown(f"**{code_x['code_name']}**")
+                        st.caption(code_x.get('definition') or '（定義なし）')
+
+                        if edit_blocked:
+                            st.caption('※ 上の編集案（①②）を確定/キャンセル後に')
+                        elif cand.get('proposals') is None:
+                            if st.button('🤖 分割案を作成', key=f'propose_split_{i}', width='stretch'):
+                                with st.spinner('分割案を作成中...'):
+                                    client = make_client('Anthropic', api_key)
+                                    proposed = llm_propose_split(client, code_x, result.get('q_name', q_name))
+                                if proposed and len(proposed.get('codes', [])) == 2:
+                                    cand['proposals'] = proposed['codes']
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                                else:
+                                    reason = get_last_error() or '原因不明（AIから有効な提案が返されませんでした）'
+                                    st.error(f'分割案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
+                        else:
+                            st.markdown('**分割案**（内容は編集できます）')
+                            new_names, new_defs = [], []
+                            for k, prop in enumerate(cand['proposals']):
+                                st.markdown(f'分割案{k + 1}')
+                                new_names.append(st.text_input(
+                                    f'分割案{k + 1}のコード名', value=prop.get('code_name', ''),
+                                    key=f'split_name_{i}_{k}', label_visibility='collapsed',
+                                ))
+                                new_defs.append(st.text_area(
+                                    f'分割案{k + 1}の定義', value=prop.get('definition', ''),
+                                    key=f'split_def_{i}_{k}', height=80, label_visibility='collapsed',
+                                ))
+                            ac1, ac2 = st.columns(2)
+                            with ac1:
+                                if st.button('✅ 採用する', type='primary', key=f'adopt_split_{i}', width='stretch'):
+                                    target_cat_id = code_x.get('cat_id')
+                                    new_codes = [
+                                        {
+                                            'code_name':  new_names[k].strip() or cand['proposals'][k].get('code_name', ''),
+                                            'definition': new_defs[k].strip(),
+                                            'keywords':   cand['proposals'][k].get('keywords', []),
+                                        }
+                                        for k in range(2)
+                                    ]
+                                    staged = result.setdefault('pending_codebook_changes', [])
+                                    staged.append({
+                                        'kind': 'split',
+                                        'remove_ids': [cand['code_id']],
+                                        'target_cat_id': target_cat_id,
+                                        'new_codes': new_codes,
+                                        'label': f"「{code_x['code_name']}」を「{new_codes[0]['code_name']}」と"
+                                                 f"「{new_codes[1]['code_name']}」に分割（分割候補の採用）",
+                                        'source_names': [code_x['code_name']],
+                                    })
+                                    edit_queue_split.pop(i)
+                                    for k in range(2):
+                                        st.session_state.pop(f'split_name_{i}_{k}', None)
+                                        st.session_state.pop(f'split_def_{i}_{k}', None)
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                            with ac2:
+                                if st.button('❌ 中止する', key=f'cancel_split_{i}', width='stretch'):
+                                    cand['proposals'] = None
+                                    for k in range(2):
+                                        st.session_state.pop(f'split_name_{i}_{k}', None)
+                                        st.session_state.pop(f'split_def_{i}_{k}', None)
+                                    _save_edit_tab_result()
+                                    st.rerun()
+                if st.button('候補から削除', key=f'remove_split_{i}'):
+                    edit_queue_split.pop(i)
+                    _save_edit_tab_result()
+                    st.rerun()
+
+    st.divider()
+    st.markdown('##### 📝 コードブックへの反映待ち')
+    if not pending_cb_changes:
+        st.caption('「採用する」で作った変更がここに並びます。統合・分割の作業がひと通り終わったら、'
+                   '下の「コードブックを書き換える」でまとめて反映してください。')
+    else:
+        for j, chg in enumerate(pending_cb_changes):
+            with st.container(border=True):
+                if chg['kind'] == 'merge':
+                    new_name = chg['new_codes'][0]['code_name']
+                    st.markdown(f"🔗 統合：{chg['source_names'][0]}　＋　{chg['source_names'][1]}　→　**{new_name}**")
+                else:
+                    new_names = '、'.join(nc['code_name'] for nc in chg['new_codes'])
+                    st.markdown(f"✂️ 分割：{chg['source_names'][0]}　→　**{new_names}**")
+                if st.button('取り消す', key=f'undo_staged_{j}'):
+                    pending_cb_changes.pop(j)
+                    _save_edit_tab_result()
+                    st.rerun()
+
+        if edit_blocked:
+            st.caption('※ 上の編集案（①②）を確定/キャンセル後に書き換えられます。')
+        elif st.button('📝 コードブックを書き換える', type='primary', width='stretch', key='commit_staged_changes'):
+            _, dupes = _apply_staged_changes(result, pending_cb_changes)
+            if dupes:
+                st.error('コード名が重複しています（既存のコード、または今回追加する別のコードと重複）：'
+                          + '、'.join(dupes) + '　該当する提案のコード名を修正するか、取り消してから'
+                          '再度お試しください。')
+            else:
+                result['pending_codebook_changes'] = []
+                _save_edit_tab_result()
+                st.success('✅ コードブックを書き換えました。')
+                st.rerun()
+
+
+def _render_cross_tab_tab(result):
+    """
+    「クロス集計」タブ：属性（年代・職位など、Excel取り込み時に列指定した属性）を1つ選び、
+    コード×属性値のクロス集計表（実数・出現率%）と横棒グラフを表示する。2026-08-18追加。
+    ％は既存のGT集計と同じ考え方（その属性値グループの有効回答数に対する出現率）で計算する。
+    """
+    coded_count = result.get('coded_count', 0)
+    items   = result.get('items', [])[:coded_count]
+    results = result.get('results', [])
+    codes   = result.get('codes', [])
+    gt      = result.get('gt', [])
+
+    if not codes or not gt or coded_count == 0:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブでコーディングを実行してください。')
+        return
+
+    # 属性キー一覧（自由回答一覧シートと同じ、最初に登場した順）
+    attr_keys = []
+    for it in items:
+        for k in it.get('attrs', {}):
+            if k not in attr_keys:
+                attr_keys.append(k)
+
+    if not attr_keys:
+        st.info('属性列が設定されていません。「📊 Excelファイル（ID・属性列あり）」でアップロードする際に'
+                '属性として使う列を選択すると、ここでクロス集計ができます。')
+        return
+
+    attr_key = st.selectbox('クロスする属性を選択', attr_keys, key='cross_tab_attr_select')
+
+    if st.button('📊 クロス集計を開始', key='cross_tab_start_btn'):
+        st.session_state.cross_tab_active_attr = attr_key
+
+    active_attr = st.session_state.get('cross_tab_active_attr')
+    if not active_attr or active_attr not in attr_keys:
+        return
+
+    result_map = {r['id']: r for r in results}
+
+    # 属性値ごとの母数（有効回答数）を、初出順で確定する
+    attr_values, group_total = [], {}
+    for it in items:
+        v = str(it.get('attrs', {}).get(active_attr, '') or '（未回答）')
+        if v not in group_total:
+            group_total[v] = 0
+            attr_values.append(v)
+        group_total[v] += 1
+
+    code_counts = {}
+    for it in items:
+        res = result_map.get(it['id'])
+        if not res:
+            continue
+        v = str(it.get('attrs', {}).get(active_attr, '') or '（未回答）')
+        for cid in res.get('codes', []):
+            code_counts[(cid, v)] = code_counts.get((cid, v), 0) + 1
+
+    # 順A（カテゴリ出現率順→コード出現率順）でコードを並べる。ホーム・基本集計表と同じ判定材料。
+    cat_order, cat_color_full = _category_color_map(gt, codes)
+    cat_rank     = {cid: i for i, cid in enumerate(cat_order)}
+    gt_count_map = {g['code_id']: g['count'] for g in gt}
+    codes_sorted = sorted(
+        codes,
+        key=lambda c: (cat_rank.get(c['cat_id'], len(cat_order)), -gt_count_map.get(c['code_id'], 0))
+    )
+
+    # 属性値ごとのグロス（g）＝そのグループでの該当コード数の延べ合計（複数コード該当時はnより
+    # 大きくなる。nは人数、gは延べタグ数、というアンケート集計の一般的な区別）。
+    gross_by_value = {
+        v: sum(code_counts.get((c['code_id'], v), 0) for c in codes_sorted)
+        for v in attr_values
+    }
+
+    st.divider()
+    st.markdown(f'#### 📋 クロス集計表（{active_attr} × コード）')
+    st.caption('※ ％は各属性値の有効回答数（n）に対する出現率です。グロス(g)は該当コード数の'
+               '延べ合計（複数コード該当時はnより大きくなります）：' +
+               '、'.join(f'{v}（n={group_total[v]}・g={gross_by_value[v]}）' for v in attr_values))
+
+    import pandas as pd
+
+    n_row = {'カテゴリー': '', 'コード': 'n（基数・人数）'}
+    g_row = {'カテゴリー': '', 'コード': 'グロス(g)（延べタグ数）'}
+    for v in attr_values:
+        n_row[f'{v}・実数'] = group_total[v]
+        n_row[f'{v}・％']   = ''
+        g_row[f'{v}・実数'] = gross_by_value[v]
+        g_row[f'{v}・％']   = ''
+
+    table_rows  = [n_row, g_row]
+    row_cat_ids = [None, None]
+    for c in codes_sorted:
+        row = {'カテゴリー': c['cat_name'], 'コード': c['code_name']}
+        for v in attr_values:
+            cnt = code_counts.get((c['code_id'], v), 0)
+            total_v = group_total[v]
+            row[f'{v}・実数']  = cnt
+            row[f'{v}・％']    = round(cnt / total_v * 100, 1) if total_v else 0.0
+        table_rows.append(row)
+        row_cat_ids.append(c['cat_id'])
+
+    df_table = pd.DataFrame(table_rows)
+    cat_col_idx  = df_table.columns.get_loc('カテゴリー')
+    code_col_idx = df_table.columns.get_loc('コード')
+
+    def _style_cat_col(row):
+        styles = [''] * len(row)
+        cat_id = row_cat_ids[row.name]
+        if cat_id is not None:
+            # ホームの「コード別GT集計」グラフの棒と同じ色（_category_color_map）をそのまま使う。
+            styles[cat_col_idx] = f'background-color: #{cat_color_full.get(cat_id, "808080")}; color: #FFFFFF; font-weight: bold;'
+        else:
+            styles[cat_col_idx]  = 'font-weight: bold; background-color: rgba(128,128,128,0.15);'
+            styles[code_col_idx] = 'font-weight: bold; background-color: rgba(128,128,128,0.15);'
+        return styles
+
+    st.dataframe(df_table.style.apply(_style_cat_col, axis=1), width='stretch', hide_index=True)
+    st.caption('※ カテゴリー欄の背景色は、ホームの「コード別GT集計」グラフの棒と同じ配色です。')
+
+    st.divider()
+    st.markdown('#### 📈 クロス集計グラフ')
+
+    import plotly.express as px
+    plot_rows = []
+    for c in codes_sorted:
+        for v in attr_values:
+            cnt = code_counts.get((c['code_id'], v), 0)
+            total_v = group_total[v]
+            plot_rows.append({
+                'コード名': c['code_name'],
+                active_attr: v,
+                '件数': cnt,
+                '出現率(%)': round(cnt / total_v * 100, 1) if total_v else 0.0,
+            })
+    df_plot = pd.DataFrame(plot_rows)
+    code_order_top_to_bottom = [c['code_name'] for c in codes_sorted]
+    fig = px.bar(
+        df_plot,
+        y='コード名',
+        x='出現率(%)',
+        color=active_attr,
+        orientation='h',
+        barmode='group',
+        category_orders={'コード名': list(reversed(code_order_top_to_bottom))},
+        labels={'出現率(%)': '出現率(%)', 'コード名': ''},
+        hover_data=['件数'],
+    )
+    # コード名（y軸ラベル）の先頭にカテゴリー色の█を付け、表側と同じ配色でカテゴリーを示す。
+    # （■よりも視認性の高い太字ブロック文字█を使う。2026-08-19、ユーザー要望で■から変更）
+    cat_id_by_name = {c['code_name']: c['cat_id'] for c in codes_sorted}
+    tick_names = list(reversed(code_order_top_to_bottom))
+    tick_text = [
+        f'<span style="color:#{cat_color_full.get(cat_id_by_name.get(name), "808080")}">█</span> {name}'
+        for name in tick_names
+    ]
+    # 凡例（下記）の文字サイズをここと明示的に揃えるため、既定値任せにせず固定値を指定する
+    # （2026-08-19、ユーザー要望：「凡例の文字サイズをグラフ内のコード名のサイズと同じに」）。
+    TICK_FONT_SIZE = 12
+    fig.update_yaxes(tickmode='array', tickvals=tick_names, ticktext=tick_text,
+                      tickfont=dict(size=TICK_FONT_SIZE))
+    fig.update_layout(
+        height=max(420, 42 * len(codes_sorted)),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=10),
+    )
+    st.plotly_chart(fig, width='stretch')
+    st.caption('※ コード名の左の█は、下のカテゴリー凡例に対応する色です。')
+
+    # カテゴリーの色凡例（グラフの色は属性値ごとの比較に使っているため、カテゴリーの色は
+    # 別途、コード名接頭の█と対応するこの凡例で示す。2026-08-19、ユーザー要望で追加）。
+    legend_html = '　'.join(
+        f'<span style="color:#{cat_color_full.get(cid, "808080")}">█</span> {name}'
+        for cid, name in {c['cat_id']: c['cat_name'] for c in codes_sorted}.items()
+    )
+    st.markdown(
+        f'<div style="text-align:center; font-size:{TICK_FONT_SIZE}px;">{legend_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════
+# バブル図（放射状：カテゴリー→コード→代表引用文、2026-08-19追加）
+# ══════════════════════════════════════════════════
+
+def _xml_escape(s):
+    """SVGのtext要素に埋め込む文字列をエスケープする（&/</>/"）。"""
+    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _svg_wrap_lines(text, max_chars):
+    """日本語は単語区切りが無いため、文字数ベースで単純に折り返す。"""
+    text = str(text)
+    lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    return lines or ['']
+
+
+def _svg_text_block(x, y, text, max_chars, font_size, fill, anchor='middle', font_weight='normal', max_lines=2):
+    """複数行に折り返したcenter/start/end基準のSVG<text>要素を返す（縦方向も中央寄せ）。"""
+    lines = _svg_wrap_lines(text, max_chars)
+    truncated = len(lines) > max_lines
+    lines = lines[:max_lines]
+    if truncated and lines:
+        lines[-1] = (lines[-1][:-1] if len(lines[-1]) >= max_chars else lines[-1]) + '…'
+    n = len(lines)
+    start_y = y - (n - 1) * font_size * 0.6
+    tspans = ''.join(
+        f'<tspan x="{x:.1f}" dy="{0 if i == 0 else font_size * 1.2:.1f}">{_xml_escape(line)}</tspan>'
+        for i, line in enumerate(lines)
+    )
+    return (f'<text x="{x:.1f}" y="{start_y:.1f}" font-size="{font_size}" fill="#{fill}" '
+            f'text-anchor="{anchor}" font-weight="{font_weight}" font-family="Meiryo, sans-serif">'
+            f'{tspans}</text>')
+
+
+def _bubble_size_tier(value, max_value):
+    """該当数から大中小3段階のサイズ区分を返す（完全比例ではなく大まかな差で十分という
+    ユーザー要望に対応。上位1/3を「大」、中間1/3を「中」、それ以外を「小」とする）。"""
+    if max_value <= 0:
+        return 'small'
+    ratio = value / max_value
+    if ratio >= 0.66:
+        return 'large'
+    if ratio >= 0.33:
+        return 'medium'
+    return 'small'
+
+
+def _representative_quotes(results, code_id, max_quotes=3, max_chars=20):
+    """指定コードが付与された文を最大max_quotes件集める（バブル図でコードバブルの周辺に
+    表示する代表引用文）。同じ回答から複数文は採用しない（多様な回答を見せるため、
+    1回答につき最初に該当した1文のみ）。長い文はmax_chars文字で切り詰める。"""
+    quotes = []
+    for res in results:
+        if len(quotes) >= max_quotes:
+            break
+        for s in res.get('sentences') or []:
+            if code_id in s.get('codes', []) and s.get('text'):
+                text = s['text']
+                if len(text) > max_chars:
+                    text = text[:max_chars] + '…'
+                quotes.append(text)
+                break
+    return quotes
+
+
+# カテゴリーの文字サイズは、cat_font（基準値＝中サイズ扱い）にこの倍率を掛けて大中小を
+# 自動で作る（ユーザー要望：「カテゴリーの文字サイズはバブルサイズに合わせて最初から
+# 大中小になっていてほしい」、2026-08-19追加）。
+_CAT_FONT_TIER_MULT = {'large': 1.25, 'medium': 1.0, 'small': 0.8}
+BUBBLE_CANVAS_SIZE = 2000  # SVGキャンバスの一辺（px）。画面表示スケール調整でも参照する。
+
+BUBBLE_PARAM_DEFAULTS = {
+    # カテゴリー：全体の中心からの距離／バブルサイズ倍率／文字サイズ（中サイズの基準値）／折り返し文字数
+    'cat_dist':  700, 'cat_size': 1.0, 'cat_font': 22, 'cat_chars': 8,
+    # コード：所属カテゴリーの中心からの距離（基本値）／バブルサイズ倍率／文字サイズ／折り返し文字数
+    'code_dist': 170, 'code_size': 1.0, 'code_font': 13, 'code_chars': 7,
+    # 文（代表引用文）：コードバブルからの距離（基本値）／文字サイズ／切り詰め文字数／表示件数上限
+    # （ラベルの枠を廃止したため、枠の幅パラメータは持たない。2026-08-19）
+    'quote_dist': 26, 'quote_font': 10, 'quote_chars': 20, 'quote_max_count': 3,
+}
+
+
+def _build_bubble_svg(gt, codes, results, cat_color_full, selected_cat_ids, q_name, params=None):
+    """
+    バブル図のSVG文字列を生成する：円周上に配置したカテゴリーバブル（中央から放射状）を
+    起点に、各カテゴリーの周りにそのカテゴリーのコードバブルを扇状に配置し、細い線で結ぶ。
+    さらに各コードバブルの外側に、該当する代表的な原文（最大3件）を短く切り詰めて添える。
+    大画面・ポスター表示を想定し、ベクター形式（SVG）で生成する——ラスター画像と違い
+    どれだけ拡大しても文字が滲まないため（ユーザー要望：「拡大すると読めるといい」）。
+    バブルの大きさは該当数に応じた大中小3段階（_bubble_size_tier）を基本に、paramsの
+    サイズ倍率でさらに拡大縮小する（完全比例ではなく大中小の差＋ユーザー調整の組み合わせ）。
+    色はホームの「コード別GT集計」グラフと同じ_category_color_map配色を使い、コード
+    バブルは同じ色の淡色版（_lighten_hex、Excel出力と共通）でカテゴリーとの親子関係を示す。
+
+    params：カテゴリー・コード・文（引用文）ごとに、バブルサイズ・親バブル中心からの距離・
+    文字サイズ・文字数を調整できるパラメータ辞書（BUBBLE_PARAM_DEFAULTSの形。省略時は既定値）。
+    2026-08-19、ユーザー要望「カテゴリー、コード、文ごとに、バブルサイズ、バブルの中心
+    （上位バブルの中心）からの距離、文字サイズ、文字数」を調整可能にするために追加。
+    コードの距離・文の距離は、密集を避けるための自動調整（コード数に応じた開き角の拡大、
+    文の段積みオフセット）をベース値に上乗せする形は維持しており、パラメータは「基準値」を
+    動かすものとして扱う（密集回避の自動調整自体は無効化しない）。
+    """
+    p = {**BUBBLE_PARAM_DEFAULTS, **(params or {})}
+
+    W = H = BUBBLE_CANVAS_SIZE
+    CX, CY = W / 2, H / 2
+    R_CAT = p['cat_dist']
+    CAT_R  = {k: v * p['cat_size'] for k, v in {'large': 95, 'medium': 75, 'small': 55}.items()}
+    CODE_R = {k: v * p['code_size'] for k, v in {'large': 40, 'medium': 32, 'small': 24}.items()}
+
+    gt_count_by_code = {g['code_id']: g['count'] for g in gt}
+    cat_total = {}
+    for g in gt:
+        if g['cat_id'] in selected_cat_ids:
+            cat_total[g['cat_id']] = cat_total.get(g['cat_id'], 0) + g['count']
+
+    cats, seen_cat = [], set()
+    for c in codes:
+        if c['cat_id'] in selected_cat_ids and c['cat_id'] not in seen_cat:
+            cats.append({'cat_id': c['cat_id'], 'cat_name': c['cat_name']})
+            seen_cat.add(c['cat_id'])
+    cats.sort(key=lambda c: -cat_total.get(c['cat_id'], 0))  # 順Aと同じ、出現数の多い順
+
+    codes_by_cat = {}
+    for c in codes:
+        if c['cat_id'] in selected_cat_ids:
+            codes_by_cat.setdefault(c['cat_id'], []).append(c)
+    for cid in codes_by_cat:
+        codes_by_cat[cid].sort(key=lambda c: -gt_count_by_code.get(c['code_id'], 0))
+
+    max_cat_total  = max(cat_total.values(), default=0)
+    max_code_count = max(
+        (gt_count_by_code.get(c['code_id'], 0) for c in codes if c['cat_id'] in selected_cat_ids),
+        default=0,
+    )
+
+    n_cat = len(cats)
+    line_svgs, code_svgs, quote_svgs, cat_svgs = [], [], [], []
+
+    for i, cat in enumerate(cats):
+        theta = (2 * math.pi * i / n_cat - math.pi / 2) if n_cat else 0.0
+        cat_cx = CX + R_CAT * math.cos(theta)
+        cat_cy = CY + R_CAT * math.sin(theta)
+        color = cat_color_full.get(cat['cat_id'], '808080')
+        cat_tier = _bubble_size_tier(cat_total.get(cat['cat_id'], 0), max_cat_total)
+        cat_r = CAT_R[cat_tier]
+        cat_font_size = round(p['cat_font'] * _CAT_FONT_TIER_MULT[cat_tier])
+
+        cat_svgs.append(f'<circle cx="{cat_cx:.1f}" cy="{cat_cy:.1f}" r="{cat_r:.1f}" '
+                         f'fill="#{color}" stroke="#FFFFFF" stroke-width="3"/>')
+        cat_svgs.append(_svg_text_block(cat_cx, cat_cy, cat['cat_name'], p['cat_chars'], cat_font_size, 'FFFFFF',
+                                         font_weight='bold', max_lines=3))
+
+        cat_codes = codes_by_cat.get(cat['cat_id'], [])
+        n_codes = len(cat_codes)
+        if n_codes == 0:
+            continue
+        spread_deg = min(160, max(50, n_codes * 20))
+        code_radius_offset = p['code_dist'] + min(90, n_codes * 6)
+        code_fill = _lighten_hex(color, 0.6)
+
+        for j, code in enumerate(cat_codes):
+            angle_offset_deg = 0.0 if n_codes == 1 else (-spread_deg / 2 + spread_deg * j / (n_codes - 1))
+            code_theta = theta + math.radians(angle_offset_deg)
+            code_cx = cat_cx + code_radius_offset * math.cos(code_theta)
+            code_cy = cat_cy + code_radius_offset * math.sin(code_theta)
+
+            code_count = gt_count_by_code.get(code['code_id'], 0)
+            code_r = CODE_R[_bubble_size_tier(code_count, max_code_count)]
+
+            line_svgs.append(f'<line x1="{cat_cx:.1f}" y1="{cat_cy:.1f}" x2="{code_cx:.1f}" y2="{code_cy:.1f}" '
+                              f'stroke="#{color}" stroke-width="1.5" opacity="0.55"/>')
+            code_svgs.append(f'<circle cx="{code_cx:.1f}" cy="{code_cy:.1f}" r="{code_r:.1f}" '
+                              f'fill="#{code_fill}" stroke="#{color}" stroke-width="2"/>')
+            code_svgs.append(_svg_text_block(code_cx, code_cy, code['code_name'], p['code_chars'], p['code_font'],
+                                              '333333', font_weight='600', max_lines=3))
+
+            quotes = _representative_quotes(results, code['code_id'], max_quotes=p['quote_max_count'],
+                                             max_chars=p['quote_chars'])
+            if quotes:
+                n_quotes = len(quotes)
+                # 引用文どうしの重なりを減らすための工夫（ユーザー提案の「斜め」「放射状」＋実データでの
+                # 見た目を受けた追加調整、2026-08-19）：
+                # ①同じコードの複数の引用文を、コードの向きを中心に扇状に広げる（単純に1本の直線上に
+                #  並べるより隣の文とぶつかりにくい）。扇の開き角は、文字数が多いほど実際に必要な
+                #  横幅も広がるため、最長の引用文の推定文字幅から動的に計算する（固定26度だけでは
+                #  長い引用文がひしめくケースで重なりが残っていたため）。
+                # ②隣り合うコード（j mod 3）で引用文までの距離を3段階でずらし、隣接コードの引用文が
+                #  同じ「輪」に重なって並ぶのを避ける（当初は2段階だったが、コード数が多いカテゴリー
+                #  では3段階の方が余裕ができる）。
+                max_q_chars = max(len(q) for q in quotes)
+                est_text_width = max_q_chars * p['quote_font'] * 0.95
+                avg_r = code_r + p['quote_dist']
+                min_fan_deg = math.degrees(est_text_width / max(avg_r, 50)) * 1.3
+                fan_spread_deg = min(80, max(26, min_fan_deg))
+                stagger = (j % 3) * (p['quote_dist'] * 1.3)
+                for k, q in enumerate(quotes):
+                    fan_offset_deg = 0.0 if n_quotes == 1 else (-fan_spread_deg / 2 + fan_spread_deg * k / (n_quotes - 1))
+                    quote_theta = code_theta + math.radians(fan_offset_deg)
+                    qdx, qdy = math.cos(quote_theta), math.sin(quote_theta)
+                    anchor = 'start' if qdx >= 0.15 else ('end' if qdx <= -0.15 else 'middle')
+                    q_r = code_r + p['quote_dist'] + stagger + k * (p['quote_dist'] * 1.3)
+                    qx, qy = code_cx + qdx * q_r, code_cy + qdy * q_r
+                    quote_svgs.append(_svg_text_block(qx, qy, q, p['quote_chars'] + 2, p['quote_font'], '555555',
+                                                       anchor=anchor, max_lines=1))
+
+    title = f'{q_name}：コード分布バブル図' if q_name else 'コード分布バブル図'
+    svg = (
+        # width/heightを明示しないと、st.html側のoverflow:autoなdivが高さ0に潰れて
+        # 何も表示されなくなる（実機テストで発見。SVGは既定でwidth/height省略時「100%」
+        # 扱いになり、高さ未確定の親要素の中では0に解決されるため）。
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
+        f'font-family="Meiryo, sans-serif">'
+        f'<rect x="0" y="0" width="{W}" height="{H}" fill="#FFFFFF"/>'
+        # タイトルは左上・レギュラー体・サイズは元の2/3（34→約23）に変更（2026-08-19、ユーザー要望）
+        + _svg_text_block(40, 45, title, 60, 23, '333333', anchor='start', font_weight='normal', max_lines=1)
+        + ''.join(line_svgs) + ''.join(code_svgs) + ''.join(quote_svgs) + ''.join(cat_svgs)
+        + '</svg>'
+    )
+    return svg
+
+
+def _render_bubble_tab(result):
+    """
+    「🫧 バブル図」タブ：中央から放射状にカテゴリー→コード→代表引用文を配置したバブル図を
+    生成する。ポスター・大画面での提示を想定し、ベクター（SVG）で生成・ダウンロードできる。
+    2026-08-19追加。カテゴリー数・コード数が多い場合（ユーザー実績：最大10カテゴリー×
+    40コード程度を想定）に画面が混み合いすぎる場合は、カテゴリーを複数回に分けて別々の
+    バブル図を生成できるよう、対象カテゴリーを選べるようにしている（ユーザー要望：
+    「難しい場合は2枚に分けることも考えます」への対応）。
+    """
+    coded_count = result.get('coded_count', 0)
+    gt      = result.get('gt', [])
+    codes   = result.get('codes', [])
+    results = result.get('results', [])
+
+    if not codes or not gt or coded_count == 0:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブでコーディングを実行してください。')
+        return
+
+    cat_order, cat_color_full = _category_color_map(gt, codes)
+    cat_name_by_id = {}
+    for c in codes:
+        cat_name_by_id.setdefault(c['cat_id'], c['cat_name'])
+    cat_options = [cid for cid in cat_order if cid in cat_name_by_id]
+
+    st.caption('中央から放射状に「カテゴリー→コード→代表的な原文」を配置したバブル図を作成します。'
+               'ポスターや大画面での提示を想定しており、SVG（ベクター形式）で生成するため'
+               '画面上で文字が小さく見えても、拡大すれば滲まずに読めます。')
+
+    selected_cats = st.multiselect(
+        '対象カテゴリーを選択（多すぎて見づらい場合は複数回に分けて生成してください）',
+        options=cat_options,
+        default=cat_options,
+        format_func=lambda cid: cat_name_by_id.get(cid, cid),
+        key='bubble_selected_cats',
+    )
+
+    with st.expander('⚙️ 詳細設定（バブルサイズ・距離・文字サイズ・文字数）'):
+        st.caption('カテゴリー・コード・文（代表引用文）それぞれについて、親バブル中心からの'
+                   '距離・バブルサイズ・文字サイズ・文字数を調整できます。')
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            st.markdown('**カテゴリー**')
+            cat_dist  = st.slider('全体の中心からの距離', 400, 900, BUBBLE_PARAM_DEFAULTS['cat_dist'],
+                                   step=20, key='bubble_cat_dist')
+            cat_size  = st.slider('バブルサイズ倍率', 0.5, 2.0, BUBBLE_PARAM_DEFAULTS['cat_size'],
+                                   step=0.1, key='bubble_cat_size')
+            cat_font  = st.slider('文字サイズ', 12, 40, BUBBLE_PARAM_DEFAULTS['cat_font'],
+                                   step=1, key='bubble_cat_font')
+            cat_chars = st.slider('文字数（折り返し）', 4, 20, BUBBLE_PARAM_DEFAULTS['cat_chars'],
+                                   step=1, key='bubble_cat_chars')
+        with pc2:
+            st.markdown('**コード**')
+            code_dist  = st.slider('カテゴリー中心からの距離', 80, 300, BUBBLE_PARAM_DEFAULTS['code_dist'],
+                                    step=10, key='bubble_code_dist')
+            code_size  = st.slider('バブルサイズ倍率', 0.5, 2.0, BUBBLE_PARAM_DEFAULTS['code_size'],
+                                    step=0.1, key='bubble_code_size')
+            code_font  = st.slider('文字サイズ', 8, 24, BUBBLE_PARAM_DEFAULTS['code_font'],
+                                    step=1, key='bubble_code_font')
+            code_chars = st.slider('文字数（折り返し）', 4, 16, BUBBLE_PARAM_DEFAULTS['code_chars'],
+                                    step=1, key='bubble_code_chars')
+        with pc3:
+            st.markdown('**文（代表引用文）**')
+            quote_dist  = st.slider('コードバブルからの距離', 10, 80, BUBBLE_PARAM_DEFAULTS['quote_dist'],
+                                     step=2, key='bubble_quote_dist')
+            quote_font  = st.slider('文字サイズ', 6, 16, BUBBLE_PARAM_DEFAULTS['quote_font'],
+                                     step=1, key='bubble_quote_font')
+            quote_chars = st.slider('文字数（切り詰め）', 8, 40, BUBBLE_PARAM_DEFAULTS['quote_chars'],
+                                     step=2, key='bubble_quote_chars')
+            quote_max_count = st.slider('表示件数の上限（コードごと）', 0, 3,
+                                         BUBBLE_PARAM_DEFAULTS['quote_max_count'],
+                                         step=1, key='bubble_quote_max_count',
+                                         help='重なりが気になる場合、件数を減らすと密集が緩和されます。')
+        st.caption('※ コードの「距離」・文の「距離」は基準値です。バブルが密集しすぎないよう、'
+                   'コード数や引用文の件数に応じた自動調整が上乗せされます。引用文どうしの重なりは'
+                   '自動でも軽減していますが、完全ではありません。気になる場合は「表示件数の上限」を'
+                   '減らすか、文字数を短くしてみてください。')
+
+    if st.button('🫧 バブル図を生成', key='bubble_generate_btn'):
+        st.session_state.bubble_svg_cats = list(selected_cats)
+        st.session_state.bubble_svg_params = {
+            'cat_dist': cat_dist, 'cat_size': cat_size, 'cat_font': cat_font, 'cat_chars': cat_chars,
+            'code_dist': code_dist, 'code_size': code_size, 'code_font': code_font, 'code_chars': code_chars,
+            'quote_dist': quote_dist, 'quote_font': quote_font, 'quote_chars': quote_chars,
+            'quote_max_count': quote_max_count,
+        }
+
+    active_cats = st.session_state.get('bubble_svg_cats')
+    if not active_cats:
+        return
+
+    n_codes_selected = sum(1 for c in codes if c['cat_id'] in active_cats)
+    st.caption(f'※ 選択中：{len(active_cats)}カテゴリー・{n_codes_selected}コード')
+
+    active_params = st.session_state.get('bubble_svg_params', BUBBLE_PARAM_DEFAULTS)
+    svg = _build_bubble_svg(gt, codes, results, cat_color_full, set(active_cats), result.get('q_name', ''),
+                             params=active_params)
+
+    # 画面表示スケール（2026-08-19追加、ユーザー要望：「画面の表示スケールが変えられないか」）。
+    # ダウンロード用のsvg（実寸2000x2000、width/height属性つき）はそのまま、画面表示用にだけ
+    # width/height属性を置き換えたコピーを作る。SVGはviewBoxを保ったままwidth/heightだけ
+    # 変えるとベクターのまま拡大縮小されるため、画質の劣化なくスケールできる。既定45%は、
+    # 900pxの表示枠に全体がだいたい収まる大きさ（2000px×45%≒900px）。
+    display_scale = st.slider('画面表示の倍率(%)', 20, 150, 45, step=5, key='bubble_display_scale',
+                               help='画面上の見た目だけを調整します。ダウンロードするSVGファイルは'
+                                    '常に実寸（2000×2000）のままです。')
+    display_px = round(BUBBLE_CANVAS_SIZE * display_scale / 100)
+    svg_display = svg.replace(
+        f'width="{BUBBLE_CANVAS_SIZE}" height="{BUBBLE_CANVAS_SIZE}"',
+        f'width="{display_px}" height="{display_px}"',
+        1,
+    )
+
+    # st.html()はDOMPurifyでサニタイズされ、<svg>要素がまるごと除去されてしまうため
+    # （実機テストで発見）、生HTMLをそのまま埋め込めるst.iframe()を使う。表示はこのタブの
+    # 自作SVGのみで外部/ユーザー入力コンテンツではないため、st.iframeのraw HTML経路を
+    # 使うリスクは無い（quoteテキストは_xml_escapeで別途エスケープ済み）。
+    # 画面上は900pxの枠内にスクロール表示する（実サイズは2000x2000あるため、そのまま置くと
+    # 縦に長大になりすぎる）。印刷・ポスター用の実寸はダウンロードしたSVGファイルの方を使う。
+    st.iframe(
+        '<div style="width:100%; height:900px; overflow:auto; box-sizing:border-box; '
+        'border:1px solid #E0E0E0; border-radius:8px; padding:8px;">' + svg_display + '</div>',
+        height=920,
+    )
+
+    st.download_button(
+        label='📥 バブル図をダウンロード（SVG）',
+        data=svg.encode('utf-8'),
+        file_name=f'AfterCoding_bubble_{datetime.now().strftime("%Y%m%d_%H%M")}.svg',
+        mime='image/svg+xml',
+        width='stretch',
+    )
+    st.caption('※ SVGファイルはブラウザや多くの画像編集ソフトで開けます。印刷・ポスター用途では'
+               'そのまま拡大しても画質が劣化しません。')
+
+
 # ══════════════════════════════════════════════════
 # Streamlit UI
 # ══════════════════════════════════════════════════
 
-st.markdown('<p class="main-title">👻 アフターコーディング支援ツール</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">アップロードした自由文回答テキストを自動でコーディングし集計します</p>', unsafe_allow_html=True)
+# 固定タイトル（👻アフターコーディング支援ツール）は2026-08-19に削除。ブランディングは
+# サイドバー（アフターコーディング支援ツール After Coder）に統合済みで、右画面はタブの
+# 表示面積を最大化するため、上部の固定見出しは持たない。
 
 # コーディングジョブ・精度診断ジョブが進行中は、進捗＋中断ボタンだけを表示してスクリプトを終了する
 # （サイドバー・結果表示など他のUIは中断可否に関わらず操作させない）。
@@ -2337,6 +3488,13 @@ if st.session_state.coding_job:
 if st.session_state.diagnostic_job:
     _render_diagnostic_job()
     st.stop()
+
+# プロジェクトファイル読み込み直後のプロジェクト名反映。st.session_state['q_name_input']は
+# 下のsidebarでウィジェットが生成された後は直接書き換えられない（Streamlitの制約）ため、
+# 読み込み処理側は代わりに'_pending_q_name'に値を置いてrerunし、ウィジェット生成より前の
+# ここで確定させる（2026-08-19、実機テストで発見・修正）。
+if '_pending_q_name' in st.session_state:
+    st.session_state['q_name_input'] = st.session_state.pop('_pending_q_name')
 
 # ── サイドバー：設定 ──────────────────────────────
 with st.sidebar:
@@ -2358,9 +3516,10 @@ with st.sidebar:
         help='Anthropic ConsoleでAPIキーを取得してください'
     )
     q_name = st.text_input(
-        '設問名',
+        'プロジェクト名',
         placeholder='例：サービスへのご意見・ご感想',
-        help='分析する自由回答設問の名前を入力してください'
+        help='分析する自由回答設問の名前を入力してください（プロジェクトファイル名やレポート見出しにも使われます）',
+        key='q_name_input',
     )
     data_context = st.text_area(
         label='分析データの特徴',
@@ -2415,11 +3574,12 @@ with st.sidebar:
     coding_scope_label = st.selectbox(
         'コーディング範囲',
         CODING_SCOPE_OPTIONS,
-        index=1,
+        index=0,
         label_visibility='collapsed',
-        help='コードブック策定（または既存コードブックの読み込み）の後、どこまでコーディングするかを選びます。'
-             'まず少量でコーディングし、結果を見ながらコードブックを編集し、'
-             '納得できたら結果画面の「続きをコーディングする」や「全件コーディング」で範囲を広げる使い方を想定しています。'
+        help='作業メニューの「コードブックの作成とコーディング」「コーディング」を実行する際に、'
+             'どこまでコーディングするかを選びます。まず少量でコーディングし、結果を見ながら'
+             'コードブックを編集し、納得できたら「全件コーディング」で範囲を広げる使い方を想定しています。'
+             '（「コードブックの作成」単体はこの設定を使わず、常にコーディングなしで実行されます）'
     )
     coding_sample_size = CODING_SCOPE_SIZES[coding_scope_label]
 
@@ -2515,6 +3675,13 @@ with st.sidebar:
                 })
                 st.session_state.history = st.session_state.history[-10:]
                 st.session_state.active_history_id = hist_id
+                # プロジェクト名の入力欄（key='q_name_input'）も読み込んだ内容に合わせておく。
+                # ウィジェット生成後にq_name_inputへ直接代入するとStreamlitAPIExceptionになる
+                # ため、'_pending_q_name'に置いてrerunし、スクリプト冒頭（ウィジェット生成前）で
+                # 反映させる。これをしないと、読み込み直後はプロジェクト名が空欄のままになり、
+                # 「コードブックの作成」（RAWデータからのリビルド）がq_name未入力を理由に
+                # 押せなくなってしまう（2026-08-18、実機テストで発見・修正）。
+                st.session_state['_pending_q_name'] = loaded_result.get('q_name', '')
                 st.success('✅ プロジェクトファイルを読み込みました')
                 st.rerun()
 
@@ -2538,238 +3705,329 @@ with st.sidebar:
         st.rerun()
 
 # ── メインエリア ──────────────────────────────────
-col1, col2 = st.columns([1, 1])
+# タブを画面最上部に固定表示する（2026-08-19）。作業メニュー・設定確認・結果表示のすべてを
+# 🏠ホームタブの中に入れ、プロジェクトが無い状態でもタブバー自体は常に見える状態にする。
+tab_home, tab_basic, tab_edit, tab_cross, tab_bubble = st.tabs(
+    ['🏠 ホーム', '📋 基本集計表', '🔧 コードブック編集', '📊 クロス集計', '🫧 バブル図']
+)
 
-with col1:
-    st.markdown('### ⬆️ データアップロード')
+with tab_home:
 
-    input_method = st.radio(
-        '入力方法を選択',
-        ['📄 テキストファイル', '📋 テキストを直接貼り付け', '📊 Excelファイル（ID・属性列あり）'],
-        horizontal=True
+    with st.expander('📖 使い方・プロジェクトファイルについて'):
+        st.markdown('''
+1. APIキーとプロジェクト名を入力
+2. 分析データの特徴を記入（任意）
+3. 作業メニューでファイルをアップロード
+4. 作業メニューの実行ボタンをクリック
+5. 結果を確認してExcelをダウンロード
+        ''')
+        st.caption('RAWデータ・コードブック・コーディング結果を1つにまとめて保存し、'
+                   '次回はアップロードのやり直しなしで続きから再開できます（サイドバー'
+                   '「💾 プロジェクトファイル」）。')
+
+    # 「今アクティブなプロジェクト」の参照。col1（作業メニュー）・col2（設定確認）の両方が使うため、
+    # ここで1回だけ引く。col2の実行ボタン（プロジェクトの作成のみ／コードブックの作成／作成と
+    # コーディング／コーディング）はいずれも完了後にst.rerun()するため、この直後の判定は常に
+    # 「ボタンを押す前」の状態を見ている。本計算（結果表示に使う方）はボタン処理の後に改めて行う。
+    _active_result_now = next(
+        (h['result'] for h in st.session_state.history if h['id'] == st.session_state.active_history_id),
+        None
     )
 
-    items = []
+    col1, col2 = st.columns([1, 1])
 
-    if input_method == '📄 テキストファイル':
-        uploaded = st.file_uploader(
-            'テキストファイルを選択（1行1回答）',
-            type=['txt'],
-            help='UTF-8形式のテキストファイル。1行に1つの回答を記入してください。'
-        )
-        if uploaded:
-            content = uploaded.read().decode('utf-8', errors='ignore')
-            texts   = [line.strip() for line in content.splitlines() if line.strip()]
-            items   = _items_from_texts(texts)
-            st.success(f'✅ {len(items)}件の回答を読み込みました')
-            with st.expander('回答プレビュー（先頭5件）'):
-                for i, it in enumerate(items[:5], 1):
-                    st.markdown(f'**{i}.** {it["text"]}')
+    with col1:
+        st.markdown('### 📋 新規プロジェクト作成')
+        st.caption('注・既存のプロジェクトファイルを使う場合は、サイドバー左下「📂 プロジェクトファイルを開く」から。')
 
-    elif input_method == '📋 テキストを直接貼り付け':
-        pasted = st.text_area(
-            'テキストを貼り付け（1行1回答）',
-            height=200,
-            placeholder='例：\n対応が丁寧で安心できた\n待ち時間が長かった\n先生の説明がわかりやすかった',
-            help='1行に1つの回答を入力してください。空行は自動的に除外されます。'
-        )
-        if pasted:
-            texts = [line.strip() for line in pasted.splitlines() if line.strip()]
-            items = _items_from_texts(texts)
-            st.success(f'✅ {len(items)}件の回答を読み込みました')
-            with st.expander('回答プレビュー（先頭5件）'):
-                for i, it in enumerate(items[:5], 1):
-                    st.markdown(f'**{i}.** {it["text"]}')
-
-    else:
-        import pandas as pd
-        uploaded = st.file_uploader(
-            'Excelファイルを選択',
-            type=['xlsx'],
-            help='自由記述に加えて、回答者ID・FA番号・年代や職位などの属性列を含むExcelファイルを読み込めます。'
-                 '属性は集計・コーディングの判断には使われず、レポート表示のためだけに保持されます。'
-        )
-        if uploaded:
-            df = pd.read_excel(uploaded)
-            st.caption(f'{len(df)}行を読み込みました。列の役割を指定してください。')
-            st.dataframe(df.head(), width='stretch')
-
-            text_col = st.selectbox('自由記述の列', df.columns, key='xlsx_text_col')
-            id_col   = st.selectbox('回答者IDの列（任意）', ['(なし・自動採番)'] + list(df.columns), key='xlsx_id_col')
-            fa_col   = st.selectbox('FA番号の列（任意）', ['(なし)'] + list(df.columns), key='xlsx_fa_col')
-            attr_cols = st.multiselect(
-                '属性として使う列（複数選択可・任意。年代・職位など）',
-                [c for c in df.columns if c not in {text_col, id_col, fa_col}],
-                key='xlsx_attr_cols'
+        with st.expander('📁 ファイルアップロード', expanded=(st.session_state.texts_count == 0)):
+            input_method = st.radio(
+                '入力方法を選択',
+                ['📄 テキストファイル', '📋 テキストを直接貼り付け', '📊 Excelファイル（ID・属性列あり）'],
+                horizontal=True
             )
 
-            if st.button('この内容で読み込む'):
-                built = []
-                for i, row in df.iterrows():
-                    text = str(row[text_col]).strip() if pd.notna(row[text_col]) else ''
-                    rid  = (str(row[id_col]) if id_col != '(なし・自動採番)' and pd.notna(row[id_col])
-                            else f'NO{i+1:03d}')
-                    fa   = str(row[fa_col]) if fa_col != '(なし)' and pd.notna(row[fa_col]) else None
-                    attrs = {c: row[c] for c in attr_cols}
-                    built.append({'id': rid, 'text': text, 'fa_no': fa, 'attrs': attrs})
-                st.session_state.xlsx_items = built
+            items = []
 
-            items = st.session_state.get('xlsx_items', [])
-            if items:
-                st.success(f'✅ {len(items)}件の回答を読み込みました')
-                with st.expander('回答プレビュー（先頭5件）'):
-                    for i, it in enumerate(items[:5], 1):
-                        attr_str = '、'.join(f'{k}: {v}' for k, v in it['attrs'].items())
-                        st.markdown(f'**{i}.** [{it["id"]}] {it["text"]}' + (f'　（{attr_str}）' if attr_str else ''))
+            if input_method == '📄 テキストファイル':
+                uploaded = st.file_uploader(
+                    'テキストファイルを選択（1行1回答）',
+                    type=['txt'],
+                    help='UTF-8形式のテキストファイル。1行に1つの回答を記入してください。'
+                )
+                if uploaded:
+                    content = uploaded.read().decode('utf-8', errors='ignore')
+                    texts   = [line.strip() for line in content.splitlines() if line.strip()]
+                    items   = _items_from_texts(texts)
+                    st.success(f'✅ {len(items)}件の回答を読み込みました')
+                    with st.expander('回答プレビュー（先頭5件）'):
+                        for i, it in enumerate(items[:5], 1):
+                            st.markdown(f'**{i}.** {it["text"]}')
 
-if st.session_state.texts_count != len(items):
-    st.session_state.texts_count = len(items)
-    st.rerun()
+            elif input_method == '📋 テキストを直接貼り付け':
+                pasted = st.text_area(
+                    'テキストを貼り付け（1行1回答）',
+                    height=200,
+                    placeholder='例：\n対応が丁寧で安心できた\n待ち時間が長かった\n先生の説明がわかりやすかった',
+                    help='1行に1つの回答を入力してください。空行は自動的に除外されます。'
+                )
+                if pasted:
+                    texts = [line.strip() for line in pasted.splitlines() if line.strip()]
+                    items = _items_from_texts(texts)
+                    st.success(f'✅ {len(items)}件の回答を読み込みました')
+                    with st.expander('回答プレビュー（先頭5件）'):
+                        for i, it in enumerate(items[:5], 1):
+                            st.markdown(f'**{i}.** {it["text"]}')
 
-with col2:
-    st.markdown('### ✅ 分析設定の確認')
-    if items and q_name and api_key:
-        st.markdown(f'**設問名：** {q_name}')
-        st.markdown(f'**回答数：** {len(items)}件')
-        st.markdown(f'**コード上限：** {max_codes}個')
-        st.markdown(f'**策定方式：** {codebook_mode_label}')
-        st.markdown(f'**コーディングモデル：** {coding_model_label}')
-        risk_labels = [o['label'] for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
-        st.markdown(f'**リスクチェック：** {"、".join(risk_labels) if risk_labels else "なし"}')
-        st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
-        est_min = max(3, len(items) // 100 * 2)
-        st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
-    else:
-        st.info('左サイドバーで設定を入力し、ファイルをアップロードしてください。')
-st.divider()
+            else:
+                import pandas as pd
+                uploaded = st.file_uploader(
+                    'Excelファイルを選択',
+                    type=['xlsx'],
+                    help='自由記述に加えて、回答者ID・FA番号・年代や職位などの属性列を含むExcelファイルを読み込めます。'
+                         '属性は集計・コーディングの判断には使われず、レポート表示のためだけに保持されます。'
+                )
+                if uploaded:
+                    df = pd.read_excel(uploaded)
+                    st.caption(f'{len(df)}行を読み込みました。列の役割を指定してください。')
+                    st.dataframe(df.head(), width='stretch')
 
-# ── 分析実行 ──────────────────────────────────────
-mode_ready   = codebook_mode != 'EXISTING' or existing_codebook_data is not None
-button_label = '📐 コードブック生成開始' if coding_sample_size == 0 else '🚀 分析開始'
+                    text_col = st.selectbox('自由記述の列', df.columns, key='xlsx_text_col')
+                    id_col   = st.selectbox('回答者IDの列（任意）', ['(なし・自動採番)'] + list(df.columns), key='xlsx_id_col')
+                    fa_col   = st.selectbox('FA番号の列（任意）', ['(なし)'] + list(df.columns), key='xlsx_fa_col')
+                    attr_cols = st.multiselect(
+                        '属性として使う列（複数選択可・任意。年代・職位など）',
+                        [c for c in df.columns if c not in {text_col, id_col, fa_col}],
+                        key='xlsx_attr_cols'
+                    )
 
-if st.button(button_label, type='primary', width='stretch',
-             disabled=not (items and q_name and api_key and mode_ready)):
+                    if st.button('この内容で読み込む'):
+                        built = []
+                        for i, row in df.iterrows():
+                            text = str(row[text_col]).strip() if pd.notna(row[text_col]) else ''
+                            rid  = (str(row[id_col]) if id_col != '(なし・自動採番)' and pd.notna(row[id_col])
+                                    else f'NO{i+1:03d}')
+                            fa   = str(row[fa_col]) if fa_col != '(なし)' and pd.notna(row[fa_col]) else None
+                            attrs = {c: row[c] for c in attr_cols}
+                            built.append({'id': rid, 'text': text, 'fa_no': fa, 'attrs': attrs})
+                        st.session_state.xlsx_items = built
 
-    if coding_sample_size == 0:
-        # コーディングを伴わない策定のみ：中断機能は不要なので従来通り同期実行する
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-        with st.spinner('処理中...'):
-            result = run_pipeline(
-                api_key, q_name, items, max_codes,
-                progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
-                coding_sample_size, coding_model, enabled_risks, coding_strictness
-            )
-        if result:
+                    items = st.session_state.get('xlsx_items', [])
+                    if items:
+                        st.success(f'✅ {len(items)}件の回答を読み込みました')
+                        with st.expander('回答プレビュー（先頭5件）'):
+                            for i, it in enumerate(items[:5], 1):
+                                attr_str = '、'.join(f'{k}: {v}' for k, v in it['attrs'].items())
+                                st.markdown(f'**{i}.** [{it["id"]}] {it["text"]}' + (f'　（{attr_str}）' if attr_str else ''))
+
+        if st.session_state.texts_count != len(items):
+            st.session_state.texts_count = len(items)
+            st.rerun()
+
+    with col2:
+        st.markdown('### 📋 作業メニュー')
+
+        # 「コードブックの作成」系ボタンをリビルドとして使う場合、col1で新たにファイルを
+        # アップロードしていなくても、読み込み済みプロジェクトが持つRAWデータ（items）を
+        # そのまま使えるようにする。そうしないと、既存プロジェクトを開いただけでは常に
+        # items=[]（col1は今回未アップロード）のままとなり、リビルドボタンが押せなくなる
+        # （2026-08-18、実機テストで発見・修正）。新規アップロードがあればそちらを優先する。
+        rebuild_items = items if items else (_active_result_now.get('items', []) if _active_result_now else [])
+
+        mode_ready         = codebook_mode != 'EXISTING' or existing_codebook_data is not None
+        project_only_ready = bool(items and q_name)
+        upload_ready        = bool(rebuild_items and q_name and api_key and mode_ready)
+        coding_ready         = bool(_active_result_now and _active_result_now.get('codebook') and api_key)
+
+        if st.button('📁 プロジェクトの作成のみ', type='primary', width='stretch', disabled=not project_only_ready,
+                     help='コードブック・コーディングは行わず、アップロードした内容と設定だけをプロジェクトとして'
+                          '保存します（APIキーは不要）。後でこのプロジェクトを開き、続きから作成できます。'):
             st.session_state.history_counter += 1
             hist_entry = {
                 'id':        st.session_state.history_counter,
                 'q_name':    q_name,
                 'timestamp': datetime.now(),
-                'result':    result,
+                'result': {
+                    'codebook':           None,
+                    'codes':              [],
+                    'items':              list(items),
+                    'results':            [],
+                    'coded_count':        0,
+                    'total_items':        len(items),
+                    'gt':                 [],
+                    'sent':               {'positive': 0, 'negative': 0, 'neutral': 0},
+                    'unassigned':         0,
+                    'risk_counts':        {},
+                    'enabled_risks':      enabled_risks,
+                    'answer_type_counts': {},
+                    'q_name':             q_name,
+                    'usage':              {'input': 0, 'output': 0, 'cache_read': 0, 'cache_creation': 0, 'cost_jpy': 0.0},
+                    'coding_model':       coding_model,
+                    'coding_strictness':  coding_strictness,
+                },
             }
             st.session_state.history.append(hist_entry)
             st.session_state.history = st.session_state.history[-10:]
             st.session_state.active_history_id = hist_entry['id']
-    else:
-        # コーディングを伴う場合：策定は同期実行し、コーディングは中断可能なジョブとして開始する
-        reset_token_usage()
-        client = make_client('Anthropic', api_key)
-        all_items = list(items)
-        random.shuffle(all_items)
-
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-        with st.spinner('コードブックを策定中...'):
-            codebook, codes = _build_codebook_and_codes(
-                client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
-                codebook_mode, existing_codebook_data
-            )
-
-        if codebook:
-            total_items = len(all_items)
-            target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
-
-            st.session_state.history_counter += 1
-            hist_id = st.session_state.history_counter
-            base_result = {
-                'codebook':           codebook,
-                'codes':              codes,
-                'items':              all_items,
-                'results':            [],
-                'coded_count':        0,
-                'total_items':        total_items,
-                'gt':                 [],
-                'sent':               {'positive': 0, 'negative': 0, 'neutral': 0},
-                'unassigned':         0,
-                'risk_counts':        {},
-                'enabled_risks':      enabled_risks,
-                'answer_type_counts': {},
-                'q_name':             q_name,
-                'usage':              get_token_usage(),
-                'coding_model':       coding_model,
-                'coding_strictness':  coding_strictness,
-            }
-            st.session_state.history.append({
-                'id':        hist_id,
-                'q_name':    q_name,
-                'timestamp': datetime.now(),
-                'result':    base_result,
-            })
-            st.session_state.history = st.session_state.history[-10:]
-            st.session_state.active_history_id = hist_id
-
-            _start_coding_job('initial', api_key, q_name, codes, all_items, target, hist_id,
-                               coding_model, enabled_risks, coding_strictness, reset_usage=False)
             st.rerun()
 
-active_result = None
-active_q_name = None
-for h in st.session_state.history:
-    if h['id'] == st.session_state.active_history_id:
-        active_result = h['result']
-        active_q_name = h['q_name']
-        break
+        st.caption('「コードブックの作成」系ボタンは、既にコードブックがある状態で押すと、'
+                   'RAWデータから作り直す「リビルド」になります。')
 
-if active_result:
-    result = active_result
-    q_name = active_q_name
+        if st.button('📐 コードブックの作成', type='primary', width='stretch', disabled=not upload_ready,
+                     help='コーディングは行わず、コードブックの生成のみを行います。'):
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+            with st.spinner('処理中...'):
+                result = run_pipeline(
+                    api_key, q_name, rebuild_items, max_codes,
+                    progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
+                    0, coding_model, enabled_risks, coding_strictness
+                )
+            if result:
+                st.session_state.history_counter += 1
+                hist_entry = {
+                    'id':        st.session_state.history_counter,
+                    'q_name':    q_name,
+                    'timestamp': datetime.now(),
+                    'result':    result,
+                }
+                st.session_state.history.append(hist_entry)
+                st.session_state.history = st.session_state.history[-10:]
+                st.session_state.active_history_id = hist_entry['id']
+                # ここでrerunしないと、この下にある「🧮 コーディング」ボタンのcoding_ready判定が
+                # このスクリプト実行の先頭で計算した古い_active_result_now（コードブック作成前）
+                # のままになり、実際にはコードブックができたのにボタンが無効のままになってしまう
+                # （2026-08-19、実機テストで発見・修正）。
+                st.rerun()
 
-    coded_count = result.get('coded_count', 0)
-    total_items = result.get('total_items', 0)
+        if st.button('📐➡️🧮 コードブックの作成とコーディング', type='primary', width='stretch', disabled=not upload_ready,
+                     help='コードブックを生成した後、サイドバーの「コーディング範囲」で指定した件数までコーディングします。'):
+            reset_token_usage()
+            client = make_client('Anthropic', api_key)
+            all_items = list(rebuild_items)
+            random.shuffle(all_items)
 
-    tab_home, tab_basic = st.tabs(['🏠 ホーム', '📋 基本集計表'])
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+            with st.spinner('コードブックを策定中...'):
+                codebook, codes = _build_codebook_and_codes(
+                    client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+                    codebook_mode, existing_codebook_data
+                )
 
-    with tab_home:
+            if codebook:
+                total_items = len(all_items)
+                target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
 
-        # サイドバー整理（2026-08-19）に伴い、「使い方」「プロジェクトファイルの説明」を
-        # ここへ移設。レイアウトは暫定（移設のみ）で、ホーム画面の見直し時に再調整する。
-        with st.expander('📖 使い方・プロジェクトファイルについて'):
-            st.markdown('''
-1. APIキーと設問名を入力
-2. 分析データの特徴を記入（任意）
-3. テキストファイルをアップロード
-4. 「分析開始」をクリック
-5. 結果を確認してExcelをダウンロード
-            ''')
-            st.caption('RAWデータ・コードブック・コーディング結果を1つにまとめて保存し、'
-                       '次回はアップロードのやり直しなしで続きから再開できます（サイドバー'
-                       '「💾 プロジェクトファイル」）。')
+                st.session_state.history_counter += 1
+                hist_id = st.session_state.history_counter
+                base_result = {
+                    'codebook':           codebook,
+                    'codes':              codes,
+                    'items':              all_items,
+                    'results':            [],
+                    'coded_count':        0,
+                    'total_items':        total_items,
+                    'gt':                 [],
+                    'sent':               {'positive': 0, 'negative': 0, 'neutral': 0},
+                    'unassigned':         0,
+                    'risk_counts':        {},
+                    'enabled_risks':      enabled_risks,
+                    'answer_type_counts': {},
+                    'q_name':             q_name,
+                    'usage':              get_token_usage(),
+                    'coding_model':       coding_model,
+                    'coding_strictness':  coding_strictness,
+                }
+                st.session_state.history.append({
+                    'id':        hist_id,
+                    'q_name':    q_name,
+                    'timestamp': datetime.now(),
+                    'result':    base_result,
+                })
+                st.session_state.history = st.session_state.history[-10:]
+                st.session_state.active_history_id = hist_id
 
-        if coded_count == 0:
-            st.success('✅ コードブックの生成が完了しました！')
-        elif coded_count < total_items:
-            st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
-        else:
-            st.success('✅ 分析が完了しました！')
+                _start_coding_job('initial', api_key, q_name, codes, all_items, target, hist_id,
+                                   coding_model, enabled_risks, coding_strictness, reset_usage=False)
+                st.rerun()
 
-        if coded_count > 0:
-            used_model = result.get('coding_model', CODING_MODEL)
-            used_label = next((k for k, v in CODING_MODEL_OPTIONS.items() if v == used_model), used_model)
-            st.caption(f'🧮 この分析のコーディングモデル：{used_label}（作業履歴から他の分析と比較できます）')
+        if st.button('🧮 コーディング（現在のコードブックを使用）', type='primary', width='stretch', disabled=not coding_ready,
+                     help='今表示中のコードブックはそのままに、サイドバーの「コーディング範囲」で指定した件数を'
+                          '最初からコーディングし直します。'):
+            _active_total  = _active_result_now.get('total_items', len(_active_result_now.get('items', [])))
+            coding_target  = _active_total if coding_sample_size is None else min(coding_sample_size, _active_total)
+            _start_coding_job(
+                'recode', api_key, _active_result_now.get('q_name', q_name),
+                _active_result_now['codes'], _active_result_now['items'],
+                coding_target, st.session_state.active_history_id,
+                _active_result_now.get('coding_model', CODING_MODEL),
+                _active_result_now.get('enabled_risks', []),
+                _active_result_now.get('coding_strictness', CODING_STRICTNESS),
+                reset_usage=True, prior_usage=_active_result_now.get('usage'),
+            )
+            st.rerun()
+        if not coding_ready:
+            st.caption('※ 使用できるコードブックがまだありません。先に「コードブックの作成」を行うか、'
+                       'サイドバーからプロジェクトファイルを開いてください。')
+
+        st.divider()
+        st.markdown('##### ✅ 設定確認')
+
+        has_project  = bool(items) or _active_result_now is not None
+        has_codebook = bool(_active_result_now and _active_result_now.get('codebook'))
+        has_coding   = bool(_active_result_now and _active_result_now.get('coded_count', 0) > 0)
+
+        def _status_badge(label, done):
+            return f"{'✅' if done else '⬜'} {label}"
+
+        st.markdown(
+            f"{_status_badge('プロジェクト登録', has_project)}　"
+            f"{_status_badge('コードブック', has_codebook)}　"
+            f"{_status_badge('コーディング結果', has_coding)}"
+        )
+        st.divider()
+
+        # 2026-08-19：以前は items/q_name/api_key が揃うまで案内文だけを表示していたが、
+        # サイドバーの設定内容は常に確認できた方が良いという指摘を受け、条件分岐をやめて
+        # 「設定状況」として常時表示するようにした（回答数・処理時間目安はitems依存のため
+        # アップロード後のみ追加表示する）。
+        st.markdown('##### 設定状況')
+        st.markdown(f'**プロジェクト名：** {q_name or "（未入力）"}')
+        st.markdown(f'**コード数上限：** {max_codes}個')
+        st.markdown(f'**策定方式：** {codebook_mode_label}')
+        st.markdown(f'**コーディングモデル：** {coding_model_label}')
+        risk_labels = [o['label'] for o in RISK_CHECK_OPTIONS if o['key'] in enabled_risks]
+        st.markdown(f'**リスクチェック：** {"、".join(risk_labels) if risk_labels else "なし"}')
+        st.markdown(f'**APIキー：** {"設定済み ✅" if api_key else "未設定"}')
+        if items:
+            st.markdown(f'**回答数：** {len(items)}件')
+            est_min = max(3, len(items) // 100 * 2)
+            st.info(f'⏱️ 処理時間の目安：{est_min}〜{est_min*2}分')
+
+    st.divider()
+
+    # 作業メニューのボタン処理より後で改めて引き直す（同期パス完了直後の反映を保つため。
+    # 冒頭の_active_result_nowはボタン処理"前"の状態で、col1/col2の判定にのみ使う）。
+    active_result = None
+    active_q_name = None
+    for h in st.session_state.history:
+        if h['id'] == st.session_state.active_history_id:
+            active_result = h['result']
+            active_q_name = h['q_name']
+            break
+
+    if active_result:
+        result = active_result
+        q_name = active_q_name
+
+        coded_count = result.get('coded_count', 0)
+        total_items = result.get('total_items', 0)
 
         # コスト表示（共通。プロンプトキャッシュの読み込み/書き込み分は呼び出し時点のモデル単価で
-        # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）
+        # 都度計算し累積している＝コードブック策定と方式が混在していても正確な合計になる）。
+        # 2026-08-19、作業メニュー／設定確認の直下に表示されるよう位置を変更した。
         usage      = result.get('usage', {})
         inp        = usage.get('input', 0)
         out        = usage.get('output', 0)
@@ -2790,159 +4048,33 @@ if active_result:
                 'コーディングはコードブックをプロンプトキャッシュしており、2回目以降のバッチはキャッシュ読込分が割安になります。'
             )
 
-        # ── コードブック（GT数値付き。折りたたまず常時表示、編集直後もその場で最新反映） ──
-        gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
-        st.markdown('#### 📐 コードブック')
-        render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_current')
-
-        # ── 編集指示の入力欄（コードブックの直下に固定） ──────────────
-        st.caption(
-            '⚠️ 編集すると現在の内容が置き換わります。コーディング済みの結果には自動反映されません'
-            '（反映するには下の「現在のコードブックでコーディングする」で再度コーディングしてください）。'
-            '保存しておきたい場合は、上の表の右上ツールバーから先にCSVをダウンロードしてください。'
-        )
-        with st.form('edit_instruction_form', clear_on_submit=True):
-            instruction = st.text_input(
-                '編集の指示を入力', label_visibility='collapsed',
-                placeholder='例：AとBのコードを統合して／「対応の速さ」というコードを追加して定義は〜'
-            )
-            submitted = st.form_submit_button('編集案を作成する', width='stretch')
-
-        if submitted and instruction:
-            with st.spinner('編集案を作成中...'):
-                client   = make_client('Anthropic', api_key)
-                proposed = llm_edit_codebook(client, result['codebook'], instruction, result.get('q_name', q_name))
-            if proposed:
-                result['pending_edit'] = {'instruction': instruction, 'codebook': proposed}
-                for h in st.session_state.history:
-                    if h['id'] == st.session_state.active_history_id:
-                        h['result'] = result
-                        break
-                st.rerun()
-            else:
-                reason = get_last_error() or '原因不明（AIから有効なコードブック構造が返されませんでした）'
-                st.error(f'編集案の作成に失敗しました。再度お試しください。\n\n詳細: {reason}')
-
-        # ── 編集案のプレビュー（確定・キャンセルの2段階確認） ──────────
-        pending_edit = result.get('pending_edit')
-        if pending_edit:
-            st.info(f"📝 編集案：「{pending_edit['instruction']}」（内容を確認して確定してください）")
-
-            removed, added, changed = _diff_codebook(result['codebook'], pending_edit['codebook'])
-            if removed or added or changed:
-                with st.expander(
-                    f'🔍 変更点の詳細（削除{len(removed)}・追加{len(added)}・定義や名称の変更{len(changed)}）',
-                    expanded=True,
-                ):
-                    for c in removed:
-                        st.markdown(f"- 🗑️ **削除**：{c.get('code_id')}「{c.get('code_name')}」（他のコードへ統合された可能性があります）")
-                    for c in added:
-                        st.markdown(f"- ➕ **追加**：{c.get('code_id')}「{c.get('code_name')}」")
-                    for o, n in changed:
-                        st.markdown(f"- ✏️ **変更**：{o.get('code_id')}「{o.get('code_name')}」→「{n.get('code_name')}」")
-                        st.caption(f"　旧定義：{o.get('definition', '')}")
-                        st.caption(f"　新定義：{n.get('definition', '')}")
-            else:
-                st.caption('※ コード構成に変更はありませんでした（キーワードなど、表に出づらい細部のみの調整である可能性があります）。')
-
-            render_codebook_structure(pending_edit['codebook'], gt_by_code=gt_by_code_current, key='codebook_pending')
-            pc1, pc2 = st.columns(2)
-            with pc1:
-                if st.button('✅ この内容で確定する', type='primary', width='stretch'):
-                    edit_log = result.setdefault(
-                        'edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}]
-                    )
-                    edit_log.append({'instruction': pending_edit['instruction'], 'codebook': pending_edit['codebook']})
-                    result['codebook'] = pending_edit['codebook']
-                    result['codes'] = [
-                        {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                        for cat in pending_edit['codebook'].get('categories', [])
-                        for c in cat.get('codes', [])
-                    ]
-                    del result['pending_edit']
-                    for h in st.session_state.history:
-                        if h['id'] == st.session_state.active_history_id:
-                            h['result'] = result
-                            break
-                    st.rerun()
-            with pc2:
-                if st.button('❌ キャンセル', width='stretch'):
-                    del result['pending_edit']
-                    for h in st.session_state.history:
-                        if h['id'] == st.session_state.active_history_id:
-                            h['result'] = result
-                            break
-                    st.rerun()
-
-        # ── 編集履歴 ──────────────────────────────────────────
-        edit_log = result.setdefault('edit_log', [{'instruction': '（初期状態）', 'codebook': result['codebook']}])
-        if len(edit_log) > 1:
-            with st.expander(f'📜 編集履歴（{len(edit_log)}バージョン）'):
-                for i, entry in enumerate(edit_log):
-                    n_codes = sum(len(c.get('codes', [])) for c in entry['codebook'].get('categories', []))
-                    hc1, hc2 = st.columns([4, 1])
-                    hc1.markdown(f"**v{i}** {entry['instruction']}（コード{n_codes}件）")
-                    if i != len(edit_log) - 1:
-                        if hc2.button('このバージョンに戻す', key=f'revert_edit_{i}'):
-                            edit_log.append({'instruction': f'v{i}のバージョンに戻す', 'codebook': entry['codebook']})
-                            result['codebook'] = entry['codebook']
-                            result['codes'] = [
-                                {**c, 'cat_id': cat['cat_id'], 'cat_name': cat['cat_name']}
-                                for cat in entry['codebook'].get('categories', [])
-                                for c in cat.get('codes', [])
-                            ]
-                            for h in st.session_state.history:
-                                if h['id'] == st.session_state.active_history_id:
-                                    h['result'] = result
-                                    break
-                            st.rerun()
-
-        st.divider()
-
-        # ── 現在のコードブックでコーディングする（1ボタン。左ナビの「コーディング範囲」で指定した件数を、
-        #     毎回コードブックの最新版で最初からコーディングし直す。コードブック編集後に同じ範囲で試し直す
-        #     ／最終的に「全件コーディング」で確定版を作る、という2つの使い方をこの1ボタンでまかなう。
-        #     「未コーディング分だけ追加」方式は廃止した。古いコードブックで処理済みの回答と新しいコード
-        #     ブックで処理した回答が1つの結果内に混在し、最終成果物としての一貫性が崩れるため） ──
-        if pending_edit:
-            st.caption('※ 編集案を確定またはキャンセルしてからコーディングしてください。')
+        if not result.get('codebook'):
+            st.success('✅ プロジェクトを保存しました！')
+        elif coded_count == 0:
+            st.success('✅ コードブックの生成が完了しました！')
+        elif coded_count < total_items:
+            st.success(f'✅ {coded_count}/{total_items}件をコーディングしました！')
         else:
-            coding_target = total_items if coding_sample_size is None else min(coding_sample_size, total_items)
-            if coding_target == 0:
-                st.caption('※ 左ナビの「コーディング範囲」で件数を指定してからコーディングしてください。')
-            else:
-                if st.button(f'▶ 現在のコードブックでコーディングする（全{coding_target}件）', type='primary', width='stretch'):
-                    _start_coding_job(
-                        'recode', api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                        coding_target, st.session_state.active_history_id,
-                        result.get('coding_model', CODING_MODEL), result.get('enabled_risks', []),
-                        result.get('coding_strictness', CODING_STRICTNESS),
-                        reset_usage=True, prior_usage=result.get('usage'),
-                    )
-                    st.rerun()
-                st.caption('※ 左ナビの「コーディング範囲」で指定した件数を、現在のコードブックで最初からコーディングし直します。実行中は「⏹ 中断する」でそれまでの結果を保存して打ち切れます。')
-        st.divider()
+            st.success('✅ 分析が完了しました！')
+        # 「この分析のコーディングモデル」キャプションは2026-08-19にホームから削除した
+        # （設定確認の「設定状況」で同じ情報を確認できるため）。
 
-        # ── 精度診断（標準・厳密で試しコーディングし、コード同士の混同を検出してコードブック見直し案を作る） ──
-        diag_message = result.pop('diagnostic_message', None)
-        if diag_message:
-            st.info(diag_message)
-        if pending_edit:
-            st.caption('※ 編集案を確定またはキャンセルしてから精度診断を実行してください。')
+        if not result.get('codebook'):
+            # 「📁 プロジェクトの作成のみ」で作られたプロジェクト（コードブック未作成）の場合。
+            st.info('このプロジェクトはまだコードブックがありません。作業メニューの'
+                    '「📐 コードブックの作成」または「📐➡️🧮 コードブックの作成とコーディング」を'
+                    '実行してください。')
         else:
-            diag_target = min(diagnostic_size, total_items)
-            if st.button(f'🎯 精度診断を実行（{diag_target}件を標準・厳密の両方でテスト）', width='stretch'):
-                _start_diagnostic(
-                    api_key, result.get('q_name', q_name), result['codes'], result['items'],
-                    diag_target, st.session_state.active_history_id,
-                    result.get('coding_model', CODING_MODEL),
-                )
-                st.rerun()
-            st.caption('※ 同じ回答を標準・厳密の両方でテストコーディングし、判定が割れやすいコードペアを検出して、'
-                       'コードブックの見直し案（統合または定義の書き分け）を自動作成します。'
-                       '見直し案は編集案と同じ仕組みで表示され、確定するまでコードブックには反映されません。'
-                       '通常のコーディングとは別に2回分のテストコーディング＋見直し案作成のAPIコストがかかります。')
-        st.divider()
+            # ── コードブック（GT数値付き、表示専用）──────────────────────
+            # 2026-08-19、編集関連の機能（編集案プレビュー・確定/キャンセル・精度診断・
+            # 自由チャット編集）は、すべて新設の「🔧 コードブック編集」タブへ移設した。
+            # ホームは常に「今のコードブックがどうなっているか」の確認だけを担う。
+            gt_by_code_current = {g['code_id']: {'count': g['count'], 'pct': g['pct']} for g in result.get('gt', [])}
+            st.markdown('#### 📐 コードブック')
+            render_codebook_structure(result['codebook'], gt_by_code=gt_by_code_current, key='codebook_current')
+            if result.get('pending_edit'):
+                st.caption('📝 未確定の編集案があります。「🔧 コードブック編集」タブで確認してください。')
+            st.divider()
 
         # ── コーディング結果（1件以上コーディング済みの場合のみ表示） ──────
         if coded_count > 0:
@@ -3062,5 +4194,29 @@ if active_result:
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 width='stretch',
             )
-    with tab_basic:
+
+with tab_basic:
+    # tab_basicはtab_homeの外（タブバー自体は常時表示のため）。プロジェクトが無い状態でも
+    # このタブ自体は選択できるが、中身は「まだ無い」旨の案内のみ表示する。
+    if active_result:
         _render_basic_table_tab(result)
+    else:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブの作業メニューでコードブックの作成・コーディングを行ってください。')
+
+with tab_edit:
+    if active_result:
+        _render_codebook_edit_tab(result, api_key, q_name, diagnostic_size)
+    else:
+        st.info('コードブックがまだありません。「🏠 ホーム」タブの作業メニューでコードブックの作成・コーディングを行ってください。')
+
+with tab_cross:
+    if active_result:
+        _render_cross_tab_tab(result)
+    else:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブの作業メニューでコードブックの作成・コーディングを行ってください。')
+
+with tab_bubble:
+    if active_result:
+        _render_bubble_tab(result)
+    else:
+        st.info('コーディング結果がまだありません。「🏠 ホーム」タブの作業メニューでコードブックの作成・コーディングを行ってください。')
