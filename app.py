@@ -3842,6 +3842,16 @@ with tab_home:
             st.session_state.texts_count = len(items)
             st.rerun()
 
+        st.markdown('##### 📝 コードブック作成時の要望')
+        codebook_request = st.text_area(
+            'コードブック作成時の要望', label_visibility='collapsed',
+            placeholder='例：「対応の速さ」と「説明の分かりやすさ」は別コードにしてください／'
+                        '否定的な意見も肯定的な意見と同じ粒度で細分化してください　など',
+            height=100, key='codebook_request_input',
+            help='コードブックを新規に策定・リビルドする際、この内容を優先的に反映してAIに'
+                 '作成させます（下の「分析データの特徴」より優先度の高い、具体的な指示として扱われます）。'
+        )
+
     with col2:
         st.markdown('### 📋 作業メニュー')
 
@@ -3851,6 +3861,15 @@ with tab_home:
         # items=[]（col1は今回未アップロード）のままとなり、リビルドボタンが押せなくなる
         # （2026-08-18、実機テストで発見・修正）。新規アップロードがあればそちらを優先する。
         rebuild_items = items if items else (_active_result_now.get('items', []) if _active_result_now else [])
+
+        # コードブック作成時の要望（col1）は、既存の「分析データの特徴」（サイドバー、data_context）
+        # より優先度の高い指示として、その直前に強調して連結する。data_context自体は変えず、
+        # コードブック生成呼び出し（run_pipeline/_build_codebook_and_codes）にだけ渡す専用の
+        # 変数にする（2026-08-19追加。要望はコードブック生成のみに使い、コーディング自体には使わない）。
+        effective_data_context = (
+            (f'【最優先の要望・必ず反映してください】\n{codebook_request.strip()}\n\n' if codebook_request.strip() else '')
+            + data_context
+        )
 
         mode_ready         = codebook_mode != 'EXISTING' or existing_codebook_data is not None
         project_only_ready = bool(items and q_name)
@@ -3899,7 +3918,7 @@ with tab_home:
             with st.spinner('処理中...'):
                 result = run_pipeline(
                     api_key, q_name, rebuild_items, max_codes,
-                    progress_bar, status_text, data_context, codebook_mode, existing_codebook_data,
+                    progress_bar, status_text, effective_data_context, codebook_mode, existing_codebook_data,
                     0, coding_model, enabled_risks, coding_strictness
                 )
             if result:
@@ -3930,7 +3949,7 @@ with tab_home:
             status_text  = st.empty()
             with st.spinner('コードブックを策定中...'):
                 codebook, codes = _build_codebook_and_codes(
-                    client, all_items, max_codes, q_name, data_context, progress_bar, status_text,
+                    client, all_items, max_codes, q_name, effective_data_context, progress_bar, status_text,
                     codebook_mode, existing_codebook_data
                 )
 
