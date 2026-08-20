@@ -3188,12 +3188,16 @@ BUBBLE_CANVAS_SIZE = 2000  # SVGキャンバスの一辺（px）。画面表示�
 
 BUBBLE_PARAM_DEFAULTS = {
     # カテゴリー：全体の中心からの距離／バブルサイズ倍率／文字サイズ（中サイズの基準値）／折り返し文字数
-    'cat_dist':  700, 'cat_size': 1.0, 'cat_font': 22, 'cat_chars': 8,
+    # 2026-08-19、ユーザーが実機で調整した値を初期値として採用（400/1.70/24/8）。
+    'cat_dist':  400, 'cat_size': 1.7, 'cat_font': 24, 'cat_chars': 8,
     # コード：所属カテゴリーの中心からの距離（基本値）／バブルサイズ倍率／文字サイズ／折り返し文字数
-    'code_dist': 170, 'code_size': 1.0, 'code_font': 13, 'code_chars': 7,
-    # 文（代表引用文）：コードバブルからの距離（基本値）／文字サイズ／切り詰め文字数／表示件数上限
+    # 同上（210/1.50/13/7）。
+    'code_dist': 210, 'code_size': 1.5, 'code_font': 13, 'code_chars': 7,
+    # 文（代表引用文）：コードバブルからの距離（基本値）／文字サイズ／切り詰め文字数／表示件数上限／
+    # コード→文の引き線の線幅／引き線の濃度（不透明度）
     # （ラベルの枠を廃止したため、枠の幅パラメータは持たない。2026-08-19）
     'quote_dist': 26, 'quote_font': 10, 'quote_chars': 20, 'quote_max_count': 3,
+    'quote_line_width': 1.0, 'quote_line_opacity': 0.4,
 }
 
 
@@ -3318,6 +3322,12 @@ def _build_bubble_svg(gt, codes, results, cat_color_full, selected_cat_ids, q_na
                     anchor = 'start' if qdx >= 0.15 else ('end' if qdx <= -0.15 else 'middle')
                     q_r = code_r + p['quote_dist'] + stagger + k * (p['quote_dist'] * 1.3)
                     qx, qy = code_cx + qdx * q_r, code_cy + qdy * q_r
+                    # コード→文の引き線（黒、線幅・濃度は調整可能。2026-08-19追加）。カテゴリー→コードの
+                    # 線と同じline_svgsに入れることで、コード・カテゴリーの各バブルの下に描画され、
+                    # バブルの縁からきれいに伸びているように見える（バブルの上に線が乗らない）。
+                    line_svgs.append(f'<line x1="{code_cx:.1f}" y1="{code_cy:.1f}" x2="{qx:.1f}" y2="{qy:.1f}" '
+                                      f'stroke="#000000" stroke-width="{p["quote_line_width"]}" '
+                                      f'opacity="{p["quote_line_opacity"]}"/>')
                     quote_svgs.append(_svg_text_block(qx, qy, q, p['quote_chars'] + 2, p['quote_font'], '555555',
                                                        anchor=anchor, max_lines=1))
 
@@ -3379,7 +3389,7 @@ def _render_bubble_tab(result):
         pc1, pc2, pc3 = st.columns(3)
         with pc1:
             st.markdown('**カテゴリー**')
-            cat_dist  = st.slider('全体の中心からの距離', 400, 900, BUBBLE_PARAM_DEFAULTS['cat_dist'],
+            cat_dist  = st.slider('全体の中心からの距離', 200, 900, BUBBLE_PARAM_DEFAULTS['cat_dist'],
                                    step=20, key='bubble_cat_dist')
             cat_size  = st.slider('バブルサイズ倍率', 0.5, 2.0, BUBBLE_PARAM_DEFAULTS['cat_size'],
                                    step=0.1, key='bubble_cat_size')
@@ -3405,10 +3415,17 @@ def _render_bubble_tab(result):
                                      step=1, key='bubble_quote_font')
             quote_chars = st.slider('文字数（切り詰め）', 8, 40, BUBBLE_PARAM_DEFAULTS['quote_chars'],
                                      step=2, key='bubble_quote_chars')
-            quote_max_count = st.slider('表示件数の上限（コードごと）', 0, 3,
+            quote_max_count = st.slider('表示件数の上限（コードごと）', 0, 5,
                                          BUBBLE_PARAM_DEFAULTS['quote_max_count'],
                                          step=1, key='bubble_quote_max_count',
                                          help='重なりが気になる場合、件数を減らすと密集が緩和されます。')
+            quote_line_width = st.slider('コード→文の引き線の太さ', 0.5, 4.0,
+                                          BUBBLE_PARAM_DEFAULTS['quote_line_width'],
+                                          step=0.5, key='bubble_quote_line_width')
+            quote_line_opacity = st.slider('コード→文の引き線の濃度', 0.0, 1.0,
+                                            BUBBLE_PARAM_DEFAULTS['quote_line_opacity'],
+                                            step=0.05, key='bubble_quote_line_opacity',
+                                            help='0で非表示、1で真っ黒（不透明度）になります。')
         st.caption('※ コードの「距離」・文の「距離」は基準値です。バブルが密集しすぎないよう、'
                    'コード数や引用文の件数に応じた自動調整が上乗せされます。引用文どうしの重なりは'
                    '自動でも軽減していますが、完全ではありません。気になる場合は「表示件数の上限」を'
@@ -3421,6 +3438,7 @@ def _render_bubble_tab(result):
             'code_dist': code_dist, 'code_size': code_size, 'code_font': code_font, 'code_chars': code_chars,
             'quote_dist': quote_dist, 'quote_font': quote_font, 'quote_chars': quote_chars,
             'quote_max_count': quote_max_count,
+            'quote_line_width': quote_line_width, 'quote_line_opacity': quote_line_opacity,
         }
 
     active_cats = st.session_state.get('bubble_svg_cats')
